@@ -272,6 +272,8 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.expert_cache_slots = params.expert_cache_slots;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -578,6 +580,86 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+void llama_context::init_expert_pools() {
+    expert_pools.clear();
+
+    if (cparams.expert_cache_slots <= 0) {
+        return;
+    }
+
+    if (cparams.pipeline_parallel) {
+        // the pool slots are overwritten in stream order; with pipeline parallelism a
+        // previous computation may still be reading the pool when the next one updates it
+        LLAMA_LOG_WARN("%s: expert cache disabled: not supported with pipeline parallelism\n", __func__);
+        return;
+    }
+
+    // experts are pooled on the compute backend running the layers (the first accelerator)
+    // TODO: with multiple accelerators, pick the backend of each layer instead
+    int backend_id = -1;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backends[i].get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        backend_id = i;
+        break;
+    }
+    if (backend_id < 0) {
+        LLAMA_LOG_WARN("%s: expert cache ignored: no accelerator backend found\n", __func__);
+        return;
+    }
+
+    int n_pooled = 0;
+
+    // keep the total pool memory to half of what the device reports as free, so that
+    // the compute buffers and the KV cache still fit alongside the pools
+    ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
+    size_t dev_free = 0;
+    size_t dev_total = 0;
+    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    size_t pool_budget = dev_free / 2;
+
+    // pool every MoE expert weight tensor that is actually offloaded to the host
+    for (const auto & layer : model.layers) {
+        for (ggml_tensor * w : {layer.ffn_gate_up_exps, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
+            if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
+                continue;
+            }
+
+            const int n_expert = (int) w->ne[2];
+            const int n_slots  = std::min<int64_t>((int64_t) cparams.expert_cache_slots, n_expert - 1);
+            if (n_slots <= 0) {
+                continue;
+            }
+
+            const size_t pool_size = (size_t) n_slots * w->nb[2];
+            if (pool_size > pool_budget) {
+                if (n_pooled == 0) {
+                    LLAMA_LOG_WARN("%s: expert cache disabled: %.2f GiB needed per tensor exceeds the free memory budget (%.2f GiB)\n",
+                            __func__, pool_size / 1024.0 / 1024.0 / 1024.0, pool_budget / 1024.0 / 1024.0 / 1024.0);
+                }
+                continue;
+            }
+            pool_budget -= pool_size;
+
+            ggml_tensor * table = nullptr;
+            ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, backend_id, n_slots, &table);
+            if (pool == nullptr) {
+                continue; // allocation failed, keep serving this tensor from host memory
+            }
+
+            expert_pools.emplace(w, llama_expert_pool{pool, table});
+            n_pooled++;
+        }
+    }
+
+    if (n_pooled > 0) {
+        LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors\n", __func__, n_pooled);
+    } else {
+        LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -602,6 +684,8 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    init_expert_pools();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -637,6 +721,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                init_expert_pools();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2478,6 +2563,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.expert_pools=*/ expert_pools.empty() ? nullptr : &expert_pools,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3600,6 +3686,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.expert_cache_slots          =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

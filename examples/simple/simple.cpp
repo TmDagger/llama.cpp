@@ -22,6 +22,10 @@ int main(int argc, char ** argv) {
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
+    // keep all MoE expert weights on the CPU
+    bool cmoe = false;
+    // expert slots cached in VRAM per offloaded MoE weight tensor
+    int mec = 0;
 
     // parse command line arguments
 
@@ -39,6 +43,20 @@ int main(int argc, char ** argv) {
                 if (i + 1 < argc) {
                     try {
                         n_predict = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-cmoe") == 0) {
+                cmoe = true;
+            } else if (strcmp(argv[i], "-mec") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        mec = std::stoi(argv[++i]);
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -85,6 +103,16 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
+    if (cmoe) {
+        static std::vector<llama_model_tensor_buft_override> overrides;
+        static std::vector<std::string> patterns;
+        overrides.clear();
+        patterns.clear();
+        patterns.push_back("\\.ffn_(up|down|gate|gate_up)_(ch|)exps"); // LLM_FFN_EXPS_REGEX
+        overrides.push_back({ patterns.back().c_str(), ggml_backend_cpu_buffer_type() });
+        overrides.push_back({ nullptr, nullptr });
+        model_params.tensor_buft_overrides = overrides.data();
+    }
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 
@@ -115,6 +143,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch = n_prompt;
     // enable performance counters
     ctx_params.no_perf = false;
+    ctx_params.expert_cache_slots = mec;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 

@@ -21,6 +21,9 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
+    int32_t  expert_cache_slots = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 
