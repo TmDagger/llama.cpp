@@ -619,9 +619,24 @@ void llama_context::init_expert_pools() {
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
     size_t pool_budget = dev_free / 2;
 
-    // pool every MoE expert weight tensor that is actually offloaded to the host
+    // pool every MoE expert weight tensor that is actually offloaded to the host; when a
+    // layer has both fused gate_up and separate gate/up tensors only the fused one is
+    // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
     for (const auto & layer : model.layers) {
-        for (ggml_tensor * w : {layer.ffn_gate_up_exps, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
+        ggml_tensor * tensors[2];
+        int n_tensors = 0;
+        if (layer.ffn_gate_up_exps != nullptr) {
+            tensors[n_tensors++] = layer.ffn_gate_up_exps;
+        } else {
+            if (layer.ffn_up_exps   != nullptr) tensors[n_tensors++] = layer.ffn_up_exps;
+            if (layer.ffn_gate_exps != nullptr) tensors[n_tensors++] = layer.ffn_gate_exps;
+        }
+        if (layer.ffn_down_exps != nullptr) {
+            tensors[n_tensors++] = layer.ffn_down_exps;
+        }
+
+        for (int i = 0; i < n_tensors; i++) {
+            ggml_tensor * w = tensors[i];
             if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
                 continue;
             }
