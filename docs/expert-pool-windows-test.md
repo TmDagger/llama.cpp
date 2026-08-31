@@ -42,6 +42,13 @@ cmake --build build --config Release --target test-expert-pool
 
 ## 测试矩阵（建议顺序）
 
+### 0. 方法论红线：A/B 必须独占显存
+
+开跑前停掉同机所有占用显存的服务（生产服务、其他容器）并 `nvidia-smi` 确认空闲。
+实测教训：显存被挤占时 llama-server 会在分配失败/溢出状态下跑完流程，产出"假分歧"
+数据（本仓库测试中真实发生过一次）。池注册时机在 compute buffer 之前，预算按注册时
+空闲显存的一半计算——被挤占会让哪些张量进池变得不可复现。
+
 ### 1. 正确性
 ```powershell
 # A/B 输出对比（greedy，同 seed）——两次生成的文本应完全一致
