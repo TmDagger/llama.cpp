@@ -62,6 +62,16 @@ accelerator backend is available.
 
 ## Test Matrix (suggested order)
 
+### 0. Methodology red line: A/B must own the VRAM exclusively
+
+Stop every other VRAM consumer on the machine (production services, other containers)
+and verify with `nvidia-smi` before starting. Hard-won lesson: under memory pressure
+llama-server will run through its startup flow despite failed allocations and produce
+plausible-looking but garbage outputs — i.e. a *false divergence*. (This actually
+happened once during the testing of this feature.) Pool registration happens before the
+compute buffers are reserved and budgets half of the free VRAM *at that moment* — a
+contended device makes the set of pooled tensors unreproducible.
+
 ### 1. Correctness
 
 ```powershell
