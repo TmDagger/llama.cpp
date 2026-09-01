@@ -1564,7 +1564,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             if (n_max_experts <= ep.pool->ne[2]) {
                 // out[i] = table[ids[i]] via get_rows on the flattened ids
                 // note: the expert ids are a strided view (argsort_top_k), make them contiguous
-                ggml_tensor * table = ggml_reshape_2d(ctx0, ep.table, 1, w->ne[2]);
+                // note: the table is already [1, n_expert] (no reshape view, see
+                // ggml_backend_sched_register_expert_pool) so this GET_ROWS itself starts
+                // the pooled split and consumes the freshly uploaded table
+                ggml_tensor * table = ep.table;
                 ggml_tensor * ids_flat = ggml_cont(ctx0, ids);
                 ggml_tensor * slots = ggml_get_rows(ctx0, table, ggml_reshape_1d(ctx0, ids_flat, ids->ne[0] * ids->ne[1]));
                 ids_pooled = ggml_reshape_2d(ctx0, slots, ids->ne[0], ids->ne[1]);
