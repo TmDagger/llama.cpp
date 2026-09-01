@@ -104,12 +104,13 @@ static void set_ids(ggml_backend_t accel, tensors & ts, int n_tokens,
     memcpy(ts.ids_wide->data, wide.data(), ggml_nbytes(ts.ids_wide));
 }
 
-// build the pooled wrapper chain exactly like llm_graph_context::build_lora_mm_id
+// build the pooled wrapper chain exactly like llm_graph_context::build_lora_mm_id;
+// the table is already [1, n_expert] and is fed to GET_ROWS directly (no reshape view),
+// so the remap itself anchors the pooled split and consumes the freshly uploaded table
 static ggml_tensor * pooled_ids(ggml_context * ctx, tensors & ts, int n_tokens,
         ggml_tensor * table, ggml_tensor * ids_view) {
-    ggml_tensor * t = ggml_reshape_2d(ctx, table, 1, n_expert);
     ggml_tensor * ids_flat = ggml_cont(ctx, ids_view);
-    ggml_tensor * slots = ggml_get_rows(ctx, t, ggml_reshape_1d(ctx, ids_flat, n_used * n_tokens));
+    ggml_tensor * slots = ggml_get_rows(ctx, table, ggml_reshape_1d(ctx, ids_flat, n_used * n_tokens));
     return ggml_reshape_2d(ctx, slots, n_used, n_tokens);
 }
 
