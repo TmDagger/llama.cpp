@@ -62,15 +62,21 @@ accelerator backend is available.
 
 ## Test Matrix (suggested order)
 
-### 0. Methodology red line: A/B must own the VRAM exclusively
+### 0. Methodology red lines: own the VRAM exclusively, verify the instance
 
-Stop every other VRAM consumer on the machine (production services, other containers)
-and verify with `nvidia-smi` before starting. Hard-won lesson: under memory pressure
-llama-server will run through its startup flow despite failed allocations and produce
-plausible-looking but garbage outputs — i.e. a *false divergence*. (This actually
-happened once during the testing of this feature.) Pool registration happens before the
-compute buffers are reserved and budgets half of the free VRAM *at that moment* — a
-contended device makes the set of pooled tensors unreproducible.
+**Own the VRAM**: stop every other VRAM consumer (production services, other
+containers) and verify with `nvidia-smi` before starting. Under memory pressure
+llama-server runs through its startup flow despite failed allocations and produces
+plausible-looking garbage — a *false divergence*.
+
+**Verify the instance**: before each curl, confirm the target server is the one you
+just started — check the startup log timestamp, confirm the previous instance exited,
+and check the response `timings`: `prompt_n`/`cache_n` must match expectations (a cold
+prompt must not report `cache_n = 830`). Hard-won lesson: one `-mec 32` launch failed
+with a path error (`f32.err`: `No such file or directory`) and both curls hit the
+still-running mec0 instance, producing a false "fix verified byte-identical" result
+while the real divergence was still present. Audit all three before archiving an A/B
+pair.
 
 ### 1. Correctness
 
@@ -119,6 +125,10 @@ eviction path). The log should show `pooled X offloaded MoE expert weight tensor
 - Only affects expert tensors actually placed on the host
 - One expert-id readback synchronization per offloaded MoE layer per token — cheap when
   hits dominate, a measurable tax when they don't (size `N` accordingly)
+- With the pool active, greedy output may deterministically flip a far-out near-tie
+  token vs the host-copy path (observed at byte 354 under an 834-token prompt; the
+  bypass control with pools allocated but the host path is byte-identical to `-mec 0`).
+  Quantify equivalence with `llama-perplexity -mec 0 vs -mec N`, not text A/B alone
 
 ## PR Strategy (important)
 

@@ -2,8 +2,8 @@
 
 > Draft for a ggml-org/llama.cpp discussions post. Follows up on feature request
 > [#20757](https://github.com/ggml-org/llama.cpp/issues/20757). Companion branch:
-> `moe-expert-pool`. **Status: validated on consumer hardware, long-session stability
-> test in progress.**
+> `moe-expert-pool`. **Status: validated on consumer hardware (RTX 4090, CUDA);
+> perplexity-equivalence check and long-session run in progress.**
 
 ## Summary
 
@@ -14,23 +14,23 @@ expert in and evict the least recently used slot. Expert ids are remapped to slo
 through a per-tensor map table applied with `ggml_get_rows` — **no new ggml op and no
 backend-specific code** — so CUDA, Vulkan, Metal and CPU all work unchanged.
 
-Measured on a single RTX 4090 24 GB running Qwen3.8-Flash-Next (qwen4exp, 48 MoE
-layers, top-8, all experts on CPU, Q3_K_XL, 8 K context):
+Measured on a single RTX 4090 24 GB, Qwen3.8-Flash-Next (qwen4exp, 48 MoE layers, all
+experts on CPU, UD-Q3_K_XL, 8 K context, greedy):
 
-| -mec | decode tg512 (t/s) | vs baseline | prefill pp512 |
-|-----:|-------------------:|------------:|--------------:|
-| 0    | 11.55 ± 0.41       | —           | 104.5 ± 9.9   |
-| 16   | 12.89 ± 0.33       | +12%        | —             |
-| 32   | 17.54 ± 0.15       | +52%        | 119.1 ± 10.9  |
-| 48   | 19.09 ± 0.62       | +65%        | —             |
-| 64   | 21.21 ± 0.46       | **+84%**    | —             |
-| 0 (rerun) | 113.4 pp2048  | prefill baseline | —        |
-| 32 (pp2048) | 112.9 ± 4.8 | prefill unchanged | —       |
+| -mec | decode tg512 (t/s) | vs baseline | prefill          |
+|-----:|-------------------:|------------:|------------------|
+| 0    | 11.55 ± 0.41       | —           | pp512 104.5 ± 9.9 / pp2048 113.4 ± 5.7 |
+| 16   | 12.89 ± 0.33       | +12%        | —                |
+| 32   | 17.54 ± 0.15       | +52%        | pp512 119.1 ± 10.9 / pp2048 112.9 ± 4.8 |
+| 48   | 19.09 ± 0.62       | +65%        | —                |
+| 64   | 21.21 ± 0.46       | **+84%**    | —                |
 
-Greedy A/B on the real model is **byte-identical** between `-mec 0` and `-mec 32`
-(independent baseline reruns agree byte-for-byte). A backend matrix test passes
-bit-exact on CUDA (RTX 4090) and Metal (AMD dGPU): 5 quant types × dual pools sharing
-one routing × ubatch sizes 1/3 × cold / full-eviction / hit+reload / graph-rebuild.
+Prefill is unchanged within noise by construction (below). A backend-level matrix test
+passes **bit-exact** on CUDA (RTX 4090) and Metal (AMD dGPU): 5 quant types × dual pools
+sharing one routing × ubatch sizes 1/3 × cold / full-eviction / hit+reload /
+graph-rebuild. Server-level greedy A/B initially diverged deterministically from the
+host-copy path; root cause was found and fixed (details in *Validation* — including one
+invalid verification round we are disclosing rather than hiding).
 
 ## Problem
 
@@ -55,22 +55,23 @@ thousands of times. #20757 requests a cache for exactly this.
   master (verified: pp512/pp2048 unchanged), and prefill never evicts decode state.
 - Prior PRs in this space (#21614/#21620/#24524) were closed for scope/review reasons;
   this branch is deliberately small in backend impact: zero kernel changes, one
-  scheduler hook, ~650 lines total of which ~300 are the scheduler core.
+  scheduler hook, ~700 lines total of which ~350 are the scheduler core.
 
 ## Design
 
 1. `ggml_backend_sched_register_expert_pool(sched, w, backend_id, n_slots, &table)`
    allocates `n_slots * expert_size` (+ a small NaN-safe tail) on the compute backend
-   and a host-side I32 `map_table[n_expert]` (flagged as a graph input).
+   and a host-side I32 `map_table` shaped `[1, n_expert]` (flagged as a graph input).
 2. `llm_graph_context::build_lora_mm_id` — the single funnel for all MoE expert
    matmuls — routes through the pool when one is registered for the tensor **and** the
    ubatch cannot select more distinct experts than slots (`n_expert_used * n_tokens ≤
-   n_slots`). The remap is `get_rows(reshape(table), ids)`: three existing ops.
-3. Before each split that reads a pool, the scheduler reads the (original) expert ids
-   back to the host (the router is guaranteed to be in a previous split — pooled
-   `MUL_MAT_ID` nodes force a split boundary), updates LRU state, issues async H2D
-   copies for misses, and rewrites the map table; the regular split input-copy path
-   then uploads the table as it would any input.
+   n_slots`). The remap is `get_rows(table, cont(ids))`: existing ops only.
+3. The map-table buffer is registered with the scheduler's pooled-split boundary check,
+   so the remap `GET_ROWS` always anchors its own split. In that split's prologue the
+   scheduler reads the (original) expert ids back to the host, updates LRU state,
+   issues async H2D copies for misses and rewrites the map table — *before* the same
+   split's input copies upload the fresh table. (This ordering is the fix described
+   below; anchoring the update anywhere later lets the remap consume a stale table.)
 4. Safety rails: total pool memory is capped at half the device's free memory at load
    time (tensors beyond the budget silently keep the selective-copy path); pools are
    disabled under pipeline parallelism; slot-overflow is a hard assert instead of
@@ -81,18 +82,59 @@ full-miss worst case and measurably *slower* than master (the per-layer id readb
 synchronization has nothing to buy). Start at 2–4× top-k and scan; gains are
 routing-skew dependent (code workloads benefit most, flat-routing models least).
 
+## Validation — including a bug we found, mis-verified once, then actually fixed
+
+The full evidence chain (raw captures, the invalid round, the fix, the bypass control)
+is archived in
+[memoriaru/llama-cpp-expert-pool-stale-table-fix](https://github.com/memoriaru/llama-cpp-expert-pool-stale-table-fix).
+
+1. **Backend matrix, bit-exact.** `tests/test-expert-pool.cpp` runs the pooled
+   `MUL_MAT_ID` and the regular host-copy path in the same process — Q2_K/Q3_K/Q4_K/
+   Q6_K/Q8_0 × two pools sharing one routing (fused gate_up + down shape) × ubatch 1/3
+   × cold/evict/hit/rebuild. 40/40 on CUDA and Metal.
+2. **Server A/B diverged deterministically.** Greedy, 834-token prompt, all-experts-on-
+   CPU: `-mec 0` is run-to-run byte-identical (three runs across days and code
+   versions); `-mec 32` diverged at byte 17 on a coherent near-tie ("wants" vs "needs")
+   and stayed deterministic across environments and code revisions.
+3. **One invalid verification round, disclosed.** A first "fix verification" that
+   showed mec0/mec32 agreeing was produced against the wrong server instance — the
+   `-mec 32` launch had failed (`No such file or directory` in `f32.err`) and both
+   curls hit the still-running `-mec 0` server (visible retroactively in the response
+   `timings`: `cache_n = 830` on what should have been a cold prompt). Lesson adopted
+   in the test guide: verify the instance (startup log, prompt cache counters) before
+   trusting an A/B pair.
+4. **Root cause.** The remap `GET_ROWS` reads the map table through a `RESHAPE` view;
+   views carry no buffer, so the pooled-split boundary check (which keys on src
+   buffers) could not see it, and the remap could land in an earlier split than the
+   pool-update prologue — consuming the *previous* ubatch's table. Every cache miss
+   then read whatever expert last occupied the remapped slot (~20–30% wrong weight
+   reads per step on a 512-expert model with 32-slot pools). Small enough to stay
+   coherent, deterministic enough to reproduce byte-for-byte.
+5. **Fix.** The table is created as `[1, n_expert]` and consumed directly (no view),
+   its buffer is registered with the boundary check so the remap anchors its own
+   split, and the pool update runs at that remap, before the same split uploads the
+   fresh table. The bypass control — pools allocated but the graph on the host path —
+   is byte-identical to `-mec 0`; with the pool active the A/B now agrees for 353
+   bytes and then flips once on a near-tie (byte 354, deterministic), consistent with
+   llama.cpp's known sensitivity of kernel selection to buffer placement (the same
+   class of near-tie flips observed when changing `-ngl`/tensor placement). A
+   perplexity-equivalence check (`llama-perplexity`, -mec 0 vs -mec N) is running to
+   quantify the residual; results will be posted before any PR.
+
 ## Maintenance footprint
 
-~650 lines: `ggml-backend.cpp` (+~300, one pool struct + register/update/split-hook),
-`llama-graph.cpp` (+~20 remap), `llama-context.cpp` (+~60 registration & budget),
-argument plumbing, `llama-bench` flag, and a self-contained matrix test
-(`tests/test-expert-pool.cpp`, skips itself without an accelerator). No changes to any
-backend, no new ops, no allocator changes.
+~700 lines: `ggml-backend.cpp` (+~350: pool struct, register/update, split hooks),
+`llama-graph.cpp` (+~20 remap), `llama-context.cpp` (+~70 registration & budget),
+argument plumbing, `llama-bench` flag, and the self-contained matrix test. No changes
+to any backend, no new ops, no allocator changes.
 
 ## Limitations / future work
 
 - Single accelerator (pools go to the first device; per-layer placement is a TODO)
 - One ids readback sync per offloaded MoE layer per token — cheap when hits dominate
+- Residual near-tie divergence vs the host-copy path (see *Validation* §5) — pending
+  perplexity quantification; if it tracks the variance already accepted for `-ngl`
+  changes, we propose treating it the same way
 - No SSD tier, no prefetch, no imatrix-guided pinning (all mentioned in #20757 and
   composable later)
 - Long-session stability run in progress
@@ -109,4 +151,5 @@ cmake -B build -DGGML_CUDA=ON && cmake --build build -j
 ---
 *AI usage disclosure: this feature was developed with AI assistance (analysis, code and
 benchmarks); the author ran, verified and debugged all results on their own hardware
-and has reviewed every line.*
+and has reviewed every line — including writing the fix for the bug the validation
+uncovered.*
