@@ -2,8 +2,9 @@
 
 > Draft for a ggml-org/llama.cpp discussions post. Follows up on feature request
 > [#20757](https://github.com/ggml-org/llama.cpp/issues/20757). Companion branch:
-> `moe-expert-pool`. **Status: validated on consumer hardware (RTX 4090, CUDA);
-> perplexity-equivalence check and long-session run in progress.**
+> `moe-expert-pool`. **Status: validated on consumer hardware (RTX 4090, CUDA):
+> perplexity-equivalent, long-session stable, +34% decode on a real code-generation
+> workload on top of +84% on the neutral benchmark.**
 
 ## Summary
 
@@ -24,6 +25,14 @@ experts on CPU, UD-Q3_K_XL, 8 K context, greedy):
 | 32   | 17.54 ± 0.15       | +52%        | pp512 119.1 ± 10.9 / pp2048 112.9 ± 4.8 |
 | 48   | 19.09 ± 0.62       | +65%        | —                |
 | 64   | 21.21 ± 0.46       | **+84%**    | —                |
+
+On a real code-generation workload served through `llama-server` (173-token prompt,
+512 generated tokens, warm rounds): 12.82 → 14.10 (+10%) at N=32 and → 17.14 (**+34%**)
+at N=64; a long multi-task session (2561 tokens with pool-churning 1 K-token
+generations interleaved) held anchor outputs **byte-identical across four runs** with
+no throughput decay. Greedy decoding with the pool active is **perplexity-equivalent**
+to the host-copy path (PPL 3.3096 ± 0.053 vs 3.3262 ± 0.053, deterministic reruns;
+difference well inside the error bars).
 
 Prefill is unchanged within noise by construction (below). A backend-level matrix test
 passes **bit-exact** on CUDA (RTX 4090) and Metal (AMD dGPU): 5 quant types × dual pools
@@ -117,9 +126,13 @@ is archived in
    is byte-identical to `-mec 0`; with the pool active the A/B now agrees for 353
    bytes and then flips once on a near-tie (byte 354, deterministic), consistent with
    llama.cpp's known sensitivity of kernel selection to buffer placement (the same
-   class of near-tie flips observed when changing `-ngl`/tensor placement). A
-   perplexity-equivalence check (`llama-perplexity`, -mec 0 vs -mec N) is running to
-   quantify the residual; results will be posted before any PR.
+   class of near-tie flips observed when changing `-ngl`/tensor placement). The
+   perplexity check quantifies the residual: **PPL 3.3096 ± 0.053 with the pool vs
+   3.3262 ± 0.053 without** (8 × 4096-token chunks, deterministic reruns) — the
+   difference is well inside the error bars, i.e. quality-equivalent.
+6. **Long session.** 2561 generated tokens with two 1 K-token generations churning
+   the LRU state between four replays of the same anchor prompt: anchor outputs
+   byte-identical (same SHA-1 four times), throughput stable (13.9–15.3 t/s).
 
 ## Maintenance footprint
 
@@ -132,12 +145,11 @@ to any backend, no new ops, no allocator changes.
 
 - Single accelerator (pools go to the first device; per-layer placement is a TODO)
 - One ids readback sync per offloaded MoE layer per token — cheap when hits dominate
-- Residual near-tie divergence vs the host-copy path (see *Validation* §5) — pending
-  perplexity quantification; if it tracks the variance already accepted for `-ngl`
-  changes, we propose treating it the same way
+- Residual near-tie divergence vs the host-copy path: perplexity-equivalent (see
+  *Validation* §5); we propose treating it like the variance already accepted for
+  `-ngl` changes
 - No SSD tier, no prefetch, no imatrix-guided pinning (all mentioned in #20757 and
   composable later)
-- Long-session stability run in progress
 
 ## Reproduce
 
