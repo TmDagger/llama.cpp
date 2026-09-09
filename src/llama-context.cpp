@@ -386,6 +386,9 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        cparams.type_k = params.type_k;
+        cparams.type_v = params.type_v;
+
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
@@ -611,13 +614,35 @@ void llama_context::init_expert_pools() {
 
     int n_pooled = 0;
 
-    // keep the total pool memory to half of what the device reports as free, so that
-    // the compute buffers and the KV cache still fit alongside the pools
+    // the pool takes VRAM that the KV cache would otherwise grow into, so size the
+    // budget under an absolute rail: estimated max-context KV plus a fixed reserve
+    // must stay free, otherwise a run that is fine when cold hits the paging line at
+    // depth (858 MiB free vs 775 MiB free was measured at -1% vs -11% decode and
+    // 2.3x TTFT on a 32 GB WDDM card). note the estimate covers only the per-token
+    // growth (attention KV); recurrent-state and compute buffers are bounded and
+    // share the fixed reserve.
     ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
     size_t dev_free = 0;
     size_t dev_total = 0;
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-    size_t pool_budget = dev_free / 2;
+
+    size_t kv_max = 0;
+    for (int il = 0; il < (int) model.layers.size(); ++il) {
+        kv_max += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
+                + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
+    }
+    kv_max *= cparams.n_ctx;
+
+    constexpr size_t pool_rail = 1024ull * 1024 * 1024; // keep >= 1 GiB free at max context
+    size_t pool_budget = (dev_free > kv_max + pool_rail) ? (dev_free - kv_max - pool_rail) : 0;
+
+    LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
+            __func__, pool_budget / 1024.0 / 1024.0 / 1024.0, dev_free / 1024.0 / 1024.0 / 1024.0,
+            kv_max / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
+    if (pool_budget == 0) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: free VRAM minus max-context KV leaves less than the %.2f GiB rail\n",
+                __func__, pool_rail / 1024.0 / 1024.0 / 1024.0);
+    }
 
     // pool every MoE expert weight tensor that is actually offloaded to the host; when a
     // layer has both fused gate_up and separate gate/up tensors only the fused one is
