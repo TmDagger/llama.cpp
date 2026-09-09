@@ -1741,8 +1741,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // the GET_ROWS reads the table's device copy, so match the copy, not the
                 // registered buffer (the MMID branch below also covers single-split cases
                 // where the remap and the MUL_MAT_ID share one split)
-                if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL &&
-                        strstr(node->src[0]->name, "(expert map)") != NULL) {
+                if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL) {
                     for (auto & ep : sched->expert_pools) {
                         if (tensor_copy(ep.table, split->backend_id, sched->cur_copy) == node->src[0]) {
                             const struct ggml_tensor * ids = node->src[1];
