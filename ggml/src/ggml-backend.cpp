@@ -791,6 +791,12 @@ struct ggml_backend_sched_expert_pool {
     std::vector<uint64_t> slot_stamp;  // LRU stamps, 0 = never used
     int n_free = 0;                    // number of slots with slot_expert == -1
     uint64_t stamp = 0;
+
+    // running totals, reported when GGML_MOE_POOL_STATS is set
+    uint64_t n_hits = 0;
+    uint64_t n_misses = 0;
+    bool report_stats = false;
+    uint64_t n_reports = 0;
 };
 
 struct ggml_backend_sched_split {
@@ -2031,10 +2037,12 @@ static void ggml_backend_sched_update_expert_pool(
         int32_t slot = ep.expert_slot[e];
         if (slot >= 0) {
             // cache hit - refresh the LRU stamp
+            ep.n_hits++;
             ep.slot_stamp[slot] = ++ep.stamp;
             table[e] = slot;
             continue;
         }
+        ep.n_misses++;
 
         // cache miss - prefer a free slot, otherwise evict the least recently used one
         if (ep.n_free > 0) {
@@ -2068,6 +2076,13 @@ static void ggml_backend_sched_update_expert_pool(
             (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size,
             (size_t) slot * ep.expert_size,
             ep.expert_size);
+    }
+
+    if (ep.report_stats && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
+        ep.n_reports++;
+        GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses), %d of %d slots free\n",
+                __func__, ep.w->name, 100.0 * ep.n_hits / (ep.n_hits + ep.n_misses),
+                (unsigned long long) ep.n_hits, (unsigned long long) ep.n_misses, ep.n_free, ep.n_slots);
     }
 }
 
@@ -2161,6 +2176,7 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.slot_stamp.assign(n_slots, 0);
     ep.n_free  = n_slots;
     ep.stamp   = 0;
+    ep.report_stats = getenv("GGML_MOE_POOL_STATS") != NULL;
 
     sched->expert_pools.push_back(std::move(ep));
     sched->expert_pool_by_buf[pool_buf] = (int) sched->expert_pools.size() - 1;
