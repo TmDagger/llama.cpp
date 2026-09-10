@@ -2071,7 +2071,7 @@ static void ggml_backend_sched_update_expert_pool(
             ep.expert_size);
     }
 
-    if (ep.report_stats && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
+    if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
         ep.n_reports++;
         GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses), %d of %d slots free\n",
                 __func__, ep.w->name, 100.0 * ep.n_hits / (ep.n_hits + ep.n_misses),

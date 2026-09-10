@@ -598,6 +598,22 @@ void llama_context::init_expert_pools() {
         return;
     }
 
+    {
+        int n_accel = 0;
+        for (const auto & b : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_accel++;
+            }
+        }
+        if (n_accel > 1) {
+            // pools would live on the first accelerator while some layers run on
+            // others - the pooled FFNs would either migrate devices or copy the pool
+            // cross-device every step. untested and likely slower than the stock path.
+            LLAMA_LOG_WARN("%s: expert cache disabled: %d accelerator devices present, pooling currently supports exactly one\n", __func__, n_accel);
+            return;
+        }
+    }
+
     // experts are pooled on the compute backend running the layers (the first accelerator)
     // TODO: with multiple accelerators, pick the backend of each layer instead
     int backend_id = -1;
