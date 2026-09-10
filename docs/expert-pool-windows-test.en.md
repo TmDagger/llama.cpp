@@ -37,14 +37,26 @@ Constraints:
   step misses all slots and you pay the pool overhead (per-layer expert-id readback
   synchronization) on top of the same copies the selective path would make. Measured on
   OLMoE (64 experts, top-8, flat-ish routing): `N = 8` was ~35% *slower* than selective
-  copy. Aim for `N` covering the decode working set — start at 2–4× top-k and scan up.
+  copy. Aim for `N` covering the decode working set — start at 2–4× top-k and scan up,
+  observing the hit rate with `GGML_MOE_POOL_STATS=1` (per-pool hit/miss logged every
+  512 updates). Gains are routing-skew dependent (code workloads benefit most,
+  flat-routing models least).
+- **Mind the PCIe generation**: the pool moves expert compute from the CPU
+  (memory-bandwidth speed) to the GPU (misses stream over PCIe). On PCIe 3.0
+  (~12 GB/s) with fast multi-channel memory, a miss costs an order of magnitude more
+  than on PCIe 4.0/5.0 rigs — low N can be far *slower* than CPU-only mode (community
+  measurement: mec=16 was 2.8× slower than mec=0 on PCIe 3.0 + EPYC/8-channel DDR4,
+  while a 4090/PCIe 4.0 box saw +12% at mec=16). On such platforms either go
+  big-N/high-coverage or don't engage the cache.
 - Upper bound is `n_expert - 1`; beyond that just keep the weights in VRAM via `-ngl`.
 
 VRAM budget estimate: `offloaded MoE layers × 2–3 tensors (gate_up+down[+down]) × N ×
 bytes-per-expert`. Example: 48 layers, 128 experts, ~24 MB per Q4 expert, N = 32 →
 48×2×32×24 MB ≈ 71 GB (does not fit); N = 8 → ~18 GB. The implementation additionally
-caps the total pool memory at half of the device's free memory at load time; tensors
-beyond the budget silently keep using the selective-copy path.
+enforces an absolute VRAM rail: the pool budget is `free VRAM at load − estimated
+max-context KV − 1 GiB`, and tensors beyond the budget fall back to the selective-copy
+path — every such skip is logged, so a partially pooled model is visible in the log
+(look for the `pooled N ... (M skipped by the VRAM rail ...)` summary line).
 
 ## Windows Build
 
