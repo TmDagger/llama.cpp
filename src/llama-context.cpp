@@ -614,6 +614,7 @@ void llama_context::init_expert_pools() {
     }
 
     int n_pooled = 0;
+    int n_skipped = 0;
 
     // the pool takes VRAM that the KV cache would otherwise grow into, so size the
     // budget under an absolute rail: estimated max-context KV plus a fixed reserve
@@ -675,10 +676,9 @@ void llama_context::init_expert_pools() {
 
             const size_t pool_size = (size_t) n_slots * w->nb[2];
             if (pool_size > pool_budget) {
-                if (n_pooled == 0) {
-                    LLAMA_LOG_WARN("%s: expert cache disabled: %.2f GiB needed per tensor exceeds the free memory budget (%.2f GiB)\n",
-                            __func__, pool_size / 1024.0 / 1024.0 / 1024.0, pool_budget / 1024.0 / 1024.0 / 1024.0);
-                }
+                n_skipped++;
+                LLAMA_LOG_INFO("%s: '%s' (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
+                        __func__, w->name, n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
                 continue;
             }
             pool_budget -= pool_size;
@@ -695,7 +695,8 @@ void llama_context::init_expert_pools() {
     }
 
     if (n_pooled > 0) {
-        LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors\n", __func__, n_pooled);
+        LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors (%d skipped by the VRAM rail - those layers run the stock host-copy path)\n",
+                __func__, n_pooled, n_skipped);
     } else {
         LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
     }
