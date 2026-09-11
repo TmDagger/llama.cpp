@@ -91,6 +91,23 @@ full-miss worst case and measurably *slower* than master (the per-layer id readb
 synchronization has nothing to buy). Start at 2–4× top-k and scan; gains are
 routing-skew dependent (code workloads benefit most, flat-routing models least).
 
+The engagement criterion is predictable from hardware, without benchmarking: a pool
+pays off only where the hit rate clears the **break-even hit rate
+`h* = 1 − PCIe_BW / RAM_BW`** (hits are ~free from VRAM, misses stream over PCIe,
+and the stock path streams over RAM). Third-party measurement confirming the model
+on a PCIe 3.0 x16 / EPYC 8-channel DDR4-3200 system (136 GB/s, h* ≈ 91%), Qwen3.6-35B-A3B
+UD-Q6_K_XL with 40 of 48 MoE layers offloaded, 512-token generations:
+
+| N | per-layer hit rate | vs h* | observed |
+|--:|-------------------|-------|----------|
+| 16 | 60.7–87.4% | all below | slower than stock (2.8× at mec=16) |
+| 160 | 94.4–98.6% | all above | +54% over stock |
+| 196 | rail skipped layers 35–39 (15 tensors) | mixed execution | slower than N=160 |
+
+(Reported by @MichaelDietzel in the RFC thread. On PCIe 4.0/5.0 rigs h* sits much
+lower — a 4090 box measured +12% at N=16 — which is why the crossover must be part of
+the documentation rather than a fixed threshold.)
+
 ## Validation — including a bug we found, mis-verified once, then actually fixed
 
 The full evidence chain (raw captures, the invalid round, the fix, the bypass control)
@@ -148,6 +165,12 @@ to any backend, no new ops, no allocator changes.
 - Residual near-tie divergence vs the host-copy path: perplexity-equivalent (see
   *Validation* §5); we propose treating it like the variance already accepted for
   `-ngl` changes
+- Multi-accelerator setups: pools are built on the first accelerator only; with the
+  pool engaged and layers spread across GPUs the cache now disables itself with a
+  warning (per-device pools are the planned follow-up)
+- Platform sensitivity: on PCIe 3.0 hosts with very fast memory the break-even hit
+  rate sits high (see the h* formula above) — the documentation carries the formula
+  and the stats flag so users can predict engagement before spending GPU hours
 - No SSD tier, no prefetch, no imatrix-guided pinning (all mentioned in #20757 and
   composable later)
 
