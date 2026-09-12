@@ -84,9 +84,12 @@ thousands of times. #20757 requests a cache for exactly this.
 4. Safety rails: pool memory is sized per device as `free VRAM - rail`, where free VRAM
    is measured after the KV cache and model weights are already allocated (so KV is not
    counted twice) and the rail is a per-device reserve for compute buffers
-   (`--moe-expert-cache-rail-mb`, default 1024 MiB, comma-separated per device); tensors
-   beyond the budget keep the selective-copy path; pools are disabled under pipeline
-   parallelism; slot-overflow is a hard assert instead of silent corruption.
+   (`--moe-expert-cache-rail-mb`, default 1024 MiB, comma-separated per device). If the
+   requested slots do not fit, every tensor on that device is scaled down uniformly
+   instead of pooling some layers and dropping the rest to the host path; only if even
+   one slot per tensor does not fit is the device left on the selective-copy path.
+   Pools are disabled under pipeline parallelism; slot-overflow is a hard assert instead
+   of silent corruption.
 
 ### Multi-GPU (Phase 1)
 

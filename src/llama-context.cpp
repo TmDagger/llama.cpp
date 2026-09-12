@@ -734,10 +734,16 @@ void llama_context::init_expert_pools() {
         return (size_t) n_slots * esz + std::min<size_t>(esz, 512);
     };
 
-    // pool every MoE expert weight tensor that is offloaded to the host and whose layer
-    // runs on an accelerator; when a layer has both fused gate_up and separate gate/up
-    // tensors only the fused one is used by the graph (see build_moe_ffn), so pooling
-    // the others would waste VRAM
+    // Collect the offloaded expert weight tensors per device and the requested slot
+    // count. When a layer has both fused gate_up and separate gate/up tensors only the
+    // fused one is used by the graph (see build_moe_ffn), so pooling the others would
+    // waste VRAM.
+    struct dev_plan {
+        std::vector<ggml_tensor *> w;
+        std::vector<int>           req; // requested slots per tensor
+    };
+    std::vector<dev_plan> plans(backends.size());
+
     for (int il = 0; il < (int) model.layers.size(); ++il) {
         const auto & layer = model.layers[il];
 
@@ -750,6 +756,10 @@ void llama_context::init_expert_pools() {
         const int backend_id = backend_id_of(ldev);
         if (backend_id < 0) {
             continue;
+        }
+        const int32_t slots_dev = slots_of(backend_id);
+        if (slots_dev <= 0) {
+            continue; // expert cache disabled on this device
         }
 
         ggml_tensor * tensors[2];
@@ -770,15 +780,8 @@ void llama_context::init_expert_pools() {
                 continue;
             }
 
-            // lazily size this device's budget on the first offloaded expert tensor
-            ensure_budget(backend_id);
-
             // per-tensor slot count: gate/up side uses the gate_up override,
             // down side uses the down override (0 = fall back to the per-device -mec)
-            const int32_t slots_dev = slots_of(backend_id);
-            if (slots_dev <= 0) {
-                continue; // expert cache disabled on this device
-            }
             const bool is_gate_up = (w == layer.ffn_gate_up_exps || w == layer.ffn_up_exps || w == layer.ffn_gate_exps);
             const int32_t base_slots = is_gate_up
                 ? (cparams.expert_cache_slots_gate_up > 0 ? cparams.expert_cache_slots_gate_up : slots_dev)
@@ -794,30 +797,85 @@ void llama_context::init_expert_pools() {
                 continue;
             }
 
-            const size_t pool_size = moe_pool_footprint(w, n_slots);
-            if (pool_size > budget[backend_id]) {
-                n_skipped++;
-                LLAMA_LOG_INFO("%s: '%s' on %s (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
-                        __func__, w->name, ggml_backend_dev_name(ldev), n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
-                continue;
+            plans[backend_id].w.push_back(w);
+            plans[backend_id].req.push_back(n_slots);
+        }
+    }
+
+    // Allocate each device's pools under its budget. Rather than greedily pooling some
+    // tensors and skipping the rest (which leaves hot layers on the slow host path), fit
+    // all of the device's tensors uniformly: when the requested slots do not fit, scale
+    // every tensor's slot count down until they do. Over-requesting -mec then degrades
+    // gracefully instead of silently dropping layers to the host-copy path.
+    for (size_t b = 0; b < backends.size(); ++b) {
+        dev_plan & plan = plans[b];
+        if (plan.w.empty()) {
+            continue;
+        }
+        ensure_budget((int) b);
+
+        auto total_footprint = [&](float scale) -> size_t {
+            size_t total = 0;
+            for (size_t i = 0; i < plan.w.size(); ++i) {
+                const int slots = std::max(1, (int) ((float) plan.req[i] * scale));
+                total += moe_pool_footprint(plan.w[i], slots);
             }
-            budget[backend_id] -= pool_size;
+            return total;
+        };
+
+        float scale = 1.0f;
+        if (total_footprint(1.0f) > budget[b]) {
+            // binary search the largest uniform scale that fits the budget
+            float lo = 0.0f;
+            float hi = 1.0f;
+            for (int it = 0; it < 32; ++it) {
+                const float mid = 0.5f*(lo + hi);
+                if (total_footprint(mid) <= budget[b]) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            scale = lo;
+        }
+
+        const size_t total = total_footprint(scale);
+        if (total > budget[b]) {
+            // even one slot per tensor does not fit: leave the device on the host path
+            n_skipped += (int) plan.w.size();
+            LLAMA_LOG_WARN("%s: %s: expert cache disabled on this device, the %.2f GiB budget cannot hold one slot of every tensor (%.2f GiB)\n",
+                    __func__, ggml_backend_dev_name(ggml_backend_get_device(backends[b].get())),
+                    budget[b] / 1024.0 / 1024.0 / 1024.0, total / 1024.0 / 1024.0 / 1024.0);
+            continue;
+        }
+
+        for (size_t i = 0; i < plan.w.size(); ++i) {
+            ggml_tensor * w = plan.w[i];
+            const int n_slots = std::max(1, (int) ((float) plan.req[i] * scale));
+
+            budget[b] -= moe_pool_footprint(w, n_slots);
 
             ggml_tensor * table = nullptr;
-            ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, backend_id, n_slots, &table);
+            ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, (int) b, n_slots, &table);
             if (pool == nullptr) {
                 continue; // allocation failed, keep serving this tensor from host memory
             }
 
             expert_pools.emplace(w, llama_expert_pool{pool, table});
             n_pooled++;
-            n_pooled_dev[backend_id]++;
+            n_pooled_dev[b]++;
 
             if (cparams.expert_cache_warm > 0) {
                 const int n_pin = ggml_backend_sched_pin_expert_pool(sched.get(), pool,
                         std::min<int>(cparams.expert_cache_warm, n_slots));
                 LLAMA_LOG_DEBUG("%s: '%s' pinned %d warm experts\n", __func__, w->name, n_pin);
             }
+        }
+
+        if (scale < 1.0f) {
+            LLAMA_LOG_WARN("%s: %s: requested slots do not fit the remaining budget, scaled to %.0f%% (~%d slots per tensor)\n",
+                    __func__, ggml_backend_dev_name(ggml_backend_get_device(backends[b].get())),
+                    100.0f*scale, std::max(1, (int) ((float) plan.req[0]*scale)));
         }
     }
 
@@ -836,6 +894,8 @@ void llama_context::init_expert_pools() {
             LLAMA_LOG_INFO("%s: note: with n_seq_max=%u and n_expert_used_max=%u, ubatches selecting more than the per-tensor slots fall back to host-copy (raise -mec / per-tensor N or lower -np)\n",
                     __func__, cparams.n_seq_max, model.hparams.n_expert_used_max());
         }
+    } else if (n_skipped > 0) {
+        LLAMA_LOG_WARN("%s: expert cache had no effect: all offloaded MoE expert weight tensors were skipped by the VRAM rail\n", __func__);
     } else {
         LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
     }

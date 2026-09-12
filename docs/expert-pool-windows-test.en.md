@@ -54,9 +54,13 @@ VRAM budget estimate: `offloaded MoE layers × 2–3 tensors (gate_up+down[+down
 bytes-per-expert`. Example: 48 layers, 128 experts, ~24 MB per Q4 expert, N = 32 →
 48×2×32×24 MB ≈ 71 GB (does not fit); N = 8 → ~18 GB. The implementation additionally
 enforces a per-device VRAM rail: the pool budget is `free VRAM measured after the KV
-cache and weights are allocated − rail`, and tensors beyond the budget fall back to the
-selective-copy path — every such skip is logged, so a partially pooled model is visible
-in the log (look for the `pooled N ... (M skipped by the VRAM rail ...)` summary line).
+cache and weights are allocated − rail`. If the requested `-mec` does not fit, the slot
+count is scaled down **uniformly across all of that device's tensors** until it fits, so
+over-requesting degrades gracefully (fewer slots everywhere) instead of pooling some
+layers and dropping the rest to the slow host-copy path. `llama-server`/`llama-cli` log
+the effective per-device budget and the applied scale. Only if even one slot per tensor
+does not fit is the device left entirely on the host path. A fully pooled device is
+reported by the `pooled N offloaded MoE expert weight tensors ...` summary line.
 The rail defaults to 1024 MiB and is configurable per device. The slot count `-mec`
 takes the same per-device list form (device order), so a card with more free memory can
 keep a larger hot set:
