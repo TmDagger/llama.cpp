@@ -370,6 +370,9 @@ extern "C" {
                                        // MoE expert weight tensor (0 = disabled) [EXPERIMENTAL]
         int32_t  expert_cache_rail_mb;  // VRAM reserve kept free for compute buffers (MiB) [EXPERIMENTAL]
         bool     expert_cache_legacy_kv_estimate; // subtract estimated max-context KV from the pool budget [EXPERIMENTAL]
+        int32_t  expert_cache_slots_down;    // slots per down-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]
+        int32_t  expert_cache_slots_gate_up; // slots per gate/up-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]
+        int32_t  expert_cache_warm; // pin first N experts of each pool at init (0 = off) [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

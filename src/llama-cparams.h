@@ -27,6 +27,11 @@ struct llama_cparams {
     int32_t  expert_cache_rail_mb = 1024;
     // subtract estimated max-context KV from the pool budget (legacy, off by default)
     bool     expert_cache_legacy_kv_estimate = false;
+    // per-tensor slot overrides (0 = use expert_cache_slots)
+    int32_t  expert_cache_slots_down = 0;
+    int32_t  expert_cache_slots_gate_up = 0;
+    // pin first N experts of each pool at init (0 = off)
+    int32_t  expert_cache_warm = 0;
 
     float rope_freq_base;
     float rope_freq_scale;

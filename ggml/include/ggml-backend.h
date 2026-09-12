@@ -378,6 +378,14 @@ extern "C" {
         int                    n_slots,
         struct ggml_tensor  ** map_table);
 
+    // Preload the first n experts of a registered pool into evict-protected slots.
+    // Returns the number of experts actually pinned. See the implementation for
+    // the LLAMA_MOE_POOL_UNPIN_AFTER decay hook.
+    GGML_API int ggml_backend_sched_pin_expert_pool(
+        ggml_backend_sched_t   sched,
+        struct ggml_tensor   * pool,
+        int                    n);
+
     //
     // Meta backend
     //

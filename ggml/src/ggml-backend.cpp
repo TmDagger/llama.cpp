@@ -789,8 +789,11 @@ struct ggml_backend_sched_expert_pool {
     std::vector<int32_t>  expert_slot; // [n_expert], -1 = not cached
     std::vector<int32_t>  slot_expert; // [n_slots], -1 = free
     std::vector<uint64_t> slot_stamp;  // LRU stamps, 0 = never used
+    std::vector<char>     slot_pinned; // [n_slots], 1 = evict-protected warm slot
     int n_free = 0;                    // number of slots with slot_expert == -1
+    int n_pinned = 0;                  // number of pinned slots
     uint64_t stamp = 0;
+    uint64_t n_updates = 0;            // pool update calls (for warm unpin decay)
 
     // running totals, reported when GGML_MOE_POOL_STATS is set
     uint64_t n_hits = 0;
@@ -2038,6 +2041,7 @@ static void ggml_backend_sched_update_expert_pool(
         ep.n_misses++;
 
         // cache miss - prefer a free slot, otherwise evict the least recently used one
+        // (pinned warm slots are never evicted while protection holds)
         if (ep.n_free > 0) {
             for (int s = 0; s < ep.n_slots; s++) {
                 if (ep.slot_expert[s] < 0) {
@@ -2047,10 +2051,23 @@ static void ggml_backend_sched_update_expert_pool(
                 }
             }
         } else {
-            slot = 0;
-            for (int s = 1; s < ep.n_slots; s++) {
-                if (ep.slot_stamp[s] < ep.slot_stamp[slot]) {
+            slot = -1;
+            for (int s = 0; s < ep.n_slots; s++) {
+                if (ep.slot_pinned[s]) {
+                    continue;
+                }
+                if (slot < 0 || ep.slot_stamp[s] < ep.slot_stamp[slot]) {
                     slot = s;
+                }
+            }
+            // all slots pinned (warmup larger than the ubatch working set): fall back
+            // to plain LRU across every slot rather than stalling
+            if (slot < 0) {
+                slot = 0;
+                for (int s = 1; s < ep.n_slots; s++) {
+                    if (ep.slot_stamp[s] < ep.slot_stamp[slot]) {
+                        slot = s;
+                    }
                 }
             }
             // the routing graph guarantees that at most n_slots distinct experts are used;
@@ -2069,6 +2086,21 @@ static void ggml_backend_sched_update_expert_pool(
             (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size,
             (size_t) slot * ep.expert_size,
             ep.expert_size);
+    }
+
+    ep.n_updates++;
+
+    // optional decay of warm protection: LLAMA_MOE_POOL_UNPIN_AFTER=N lifts the
+    // pin after N pool updates (0 = keep pinned for the process lifetime)
+    if (ep.n_pinned > 0) {
+        static const long unpin_after = []() -> long {
+            const char * val = getenv("LLAMA_MOE_POOL_UNPIN_AFTER");
+            return val != nullptr ? atol(val) : 0;
+        }();
+        if (unpin_after > 0 && ep.n_updates >= (uint64_t) unpin_after) {
+            ep.slot_pinned.assign(ep.n_slots, 0);
+            ep.n_pinned = 0;
+        }
     }
 
     if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
@@ -2167,8 +2199,11 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.expert_slot.assign(n_expert, -1);
     ep.slot_expert.assign(n_slots, -1);
     ep.slot_stamp.assign(n_slots, 0);
+    ep.slot_pinned.assign(n_slots, 0);
     ep.n_free  = n_slots;
+    ep.n_pinned = 0;
     ep.stamp   = 0;
+    ep.n_updates = 0;
     ep.report_stats = getenv("GGML_MOE_POOL_STATS") != NULL;
 
     sched->expert_pools.push_back(std::move(ep));
@@ -2190,6 +2225,57 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
             w->name, ggml_backend_name(backend), n_slots, n_expert, pool_size / 1024.0 / 1024.0);
 
     return pool;
+}
+
+// Preload the first n experts of a registered pool into dedicated pinned slots.
+// Pinned slots are never evicted while protection holds (see the update path;
+// LLAMA_MOE_POOL_UNPIN_AFTER=N lifts it after N updates, 0 = process lifetime).
+// Used to skip cold-start misses for the hot expert prefix. No-op when the pool
+// is unknown or n <= 0; returns the number of experts actually pinned.
+int ggml_backend_sched_pin_expert_pool(
+        ggml_backend_sched_t   sched,
+        struct ggml_tensor   * pool,
+        int                    n) {
+    GGML_ASSERT(sched != NULL);
+    if (pool == NULL || n <= 0) {
+        return 0;
+    }
+    for (auto & ep : sched->expert_pools) {
+        if (ep.pool != pool) {
+            continue;
+        }
+        int pinned = 0;
+        const int n_pin = std::min({n, ep.n_slots, ep.n_expert});
+        for (int e = 0; e < n_pin; e++) {
+            if (ep.expert_slot[e] >= 0) {
+                continue; // already resident (should not happen at init)
+            }
+            int slot = -1;
+            for (int s = 0; s < ep.n_slots; s++) {
+                if (ep.slot_expert[s] < 0) {
+                    slot = s;
+                    ep.n_free--;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                break;
+            }
+            ggml_backend_tensor_set(ep.pool,
+                (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size,
+                (size_t) slot * ep.expert_size,
+                ep.expert_size);
+            ep.slot_expert[slot] = e;
+            ep.expert_slot[e]    = slot;
+            ep.slot_stamp[slot]  = ++ep.stamp;
+            ep.slot_pinned[slot] = 1;
+            ep.n_pinned++;
+            ((int32_t *) ep.table->data)[e] = slot;
+            pinned++;
+        }
+        return pinned;
+    }
+    return 0;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(

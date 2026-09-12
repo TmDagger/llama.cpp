@@ -2800,6 +2800,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_LEGACY_KV_ESTIMATE"));
     add_opt(common_arg(
+        {"--moe-expert-cache-down"}, "N",
+        "slots per down-expert tensor (0 = use --moe-expert-cache)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_slots_down = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_DOWN"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-gate-up"}, "N",
+        "slots per gate/up-expert tensor (0 = use --moe-expert-cache)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_slots_gate_up = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_GATE_UP"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-warm"}, "N",
+        "pin the first N experts of each pool at init to skip cold misses (0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_warm = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WARM"));
+    add_opt(common_arg(
+        {"--moe-pool-pcie-bw"}, "GB/S",
+        "PCIe bandwidth in GB/s for the h* = 1 - PCIe/RAM break-even estimate (0 = unset)",
+        [](common_params & params, const std::string & value) {
+            params.moe_pool_pcie_bw = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_POOL_PCIE_BW"));
+    add_opt(common_arg(
+        {"--moe-pool-ram-bw"}, "GB/S",
+        "RAM bandwidth in GB/s for the h* = 1 - PCIe/RAM break-even estimate (0 = unset)",
+        [](common_params & params, const std::string & value) {
+            params.moe_pool_ram_bw = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_POOL_RAM_BW"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

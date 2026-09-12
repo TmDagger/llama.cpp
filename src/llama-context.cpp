@@ -273,6 +273,9 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
 
     cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_slots_down = params.expert_cache_slots_down;
+    cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
+    cparams.expert_cache_warm = params.expert_cache_warm;
     cparams.expert_cache_rail_mb = params.expert_cache_rail_mb;
     cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 
@@ -685,6 +688,13 @@ void llama_context::init_expert_pools() {
                 cparams.expert_cache_legacy_kv_estimate ? " after the max-context KV estimate" : "");
     }
 
+    // pool footprint on the device, mirrors the register-side allocation
+    // (n_slots * expert_size + a small NaN-safe tail)
+    auto moe_pool_footprint = [](const ggml_tensor * w, int n_slots) -> size_t {
+        const size_t esz = w->nb[2];
+        return (size_t) n_slots * esz + std::min<size_t>(esz, 512);
+    };
+
     // pool every MoE expert weight tensor that is actually offloaded to the host; when a
     // layer has both fused gate_up and separate gate/up tensors only the fused one is
     // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
@@ -707,13 +717,24 @@ void llama_context::init_expert_pools() {
                 continue;
             }
 
+            // per-tensor slot count: gate/up side uses the gate_up override,
+            // down side uses the down override (0 = fall back to the common N)
+            const bool is_gate_up = (w == layer.ffn_gate_up_exps || w == layer.ffn_up_exps || w == layer.ffn_gate_exps);
+            const int32_t base_slots = is_gate_up
+                ? (cparams.expert_cache_slots_gate_up > 0 ? cparams.expert_cache_slots_gate_up : cparams.expert_cache_slots)
+                : (cparams.expert_cache_slots_down   > 0 ? cparams.expert_cache_slots_down   : cparams.expert_cache_slots);
+
             const int n_expert = (int) w->ne[2];
-            const int n_slots  = std::min<int64_t>((int64_t) cparams.expert_cache_slots, n_expert - 1);
+            if (base_slots >= n_expert) {
+                LLAMA_LOG_WARN("%s: '%s' N=%d clamped to %d (n_expert - 1)\n",
+                        __func__, w->name, base_slots, n_expert - 1);
+            }
+            const int n_slots = std::min<int64_t>((int64_t) base_slots, n_expert - 1);
             if (n_slots <= 0) {
                 continue;
             }
 
-            const size_t pool_size = (size_t) n_slots * w->nb[2];
+            const size_t pool_size = moe_pool_footprint(w, n_slots);
             if (pool_size > pool_budget) {
                 n_skipped++;
                 LLAMA_LOG_INFO("%s: '%s' (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
@@ -730,12 +751,24 @@ void llama_context::init_expert_pools() {
 
             expert_pools.emplace(w, llama_expert_pool{pool, table});
             n_pooled++;
+
+            if (cparams.expert_cache_warm > 0) {
+                const int n_pin = ggml_backend_sched_pin_expert_pool(sched.get(), pool,
+                        std::min<int>(cparams.expert_cache_warm, n_slots));
+                LLAMA_LOG_DEBUG("%s: '%s' pinned %d warm experts\n", __func__, w->name, n_pin);
+            }
         }
     }
 
     if (n_pooled > 0) {
         LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors (%d skipped by the VRAM rail - those layers run the stock host-copy path)\n",
                 __func__, n_pooled, n_skipped);
+        // decode ubatches wider than the pool fall back to the host-copy path per
+        // ubatch (see build_lora_mm_id); warn when parallel decode is likely to trip it
+        if (model.hparams.n_expert_used_max() > 0 && cparams.n_seq_max > 1) {
+            LLAMA_LOG_INFO("%s: note: with n_seq_max=%u and n_expert_used_max=%u, ubatches selecting more than the per-tensor slots fall back to host-copy (raise -mec / per-tensor N or lower -np)\n",
+                    __func__, cparams.n_seq_max, model.hparams.n_expert_used_max());
+        }
     } else {
         LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
     }
@@ -3795,6 +3828,9 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache_slots          =*/ 0,
         /*.expert_cache_rail_mb        =*/ 1024,
         /*.expert_cache_legacy_kv_estimate =*/ false,
+        /*.expert_cache_slots_down     =*/ 0,
+        /*.expert_cache_slots_gate_up  =*/ 0,
+        /*.expert_cache_warm           =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

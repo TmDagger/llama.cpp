@@ -1572,6 +1572,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                 ggml_tensor * slots = ggml_get_rows(ctx0, table, ggml_reshape_1d(ctx0, ids_flat, ids->ne[0] * ids->ne[1]));
                 ids_pooled = ggml_reshape_2d(ctx0, slots, ids->ne[0], ids->ne[1]);
                 w_pooled   = ep.pool;
+            } else {
+                // ubatch too wide for the pool (e.g. prefill or parallel decode):
+                // fall back to the stock host-copy path without evicting pool state
+                ep.n_fallback++;
             }
         }
     }

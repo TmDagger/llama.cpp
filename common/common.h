@@ -475,6 +475,11 @@ struct common_params {
     int32_t expert_cache_slots = 0;     // expert slots cached in VRAM per offloaded MoE weight tensor
     int32_t expert_cache_rail_mb = 1024; // VRAM reserve kept free for compute buffers (MiB)
     bool    expert_cache_legacy_kv_estimate = false; // subtract estimated max-context KV from pool budget
+    int32_t expert_cache_slots_down = 0;    // slots per down-expert tensor (0 = use expert_cache_slots)
+    int32_t expert_cache_slots_gate_up = 0; // slots per gate/up-expert tensor (0 = use expert_cache_slots)
+    int32_t expert_cache_warm = 0;          // pin first N experts of each pool at init (0 = off)
+    float   moe_pool_pcie_bw = 0.0f;        // PCIe BW (GB/s) for the h* break-even estimate (0 = unset)
+    float   moe_pool_ram_bw = 0.0f;         // RAM BW (GB/s) for the h* break-even estimate (0 = unset)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
