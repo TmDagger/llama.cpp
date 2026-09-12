@@ -2782,13 +2782,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
     add_opt(common_arg(
-        {"--moe-expert-cache-rail-mb"}, "N",
-        "VRAM reserve in MiB kept free for compute buffers when sizing the MoE expert cache (default: 1024)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-expert-cache-rail-mb"}, "MiB0,MiB1,...",
+        "per-device VRAM reserve in MiB kept free for compute buffers when sizing the MoE expert cache; "
+        "comma-separated, a single value is broadcast across all devices (default: 1024)",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices()));
             }
-            params.expert_cache_rail_mb = value;
+            std::vector<int32_t> values;
+            values.reserve(split_arg.size());
+            for (const auto & s : split_arg) {
+                const int32_t v = std::stoi(s);
+                if (v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                values.push_back(v);
+            }
+            if (values.size() == 1) {
+                std::fill(params.expert_cache_rail_mb.begin(), params.expert_cache_rail_mb.end(), values[0]);
+                return;
+            }
+            for (size_t i = 0; i < values.size(); i++) {
+                params.expert_cache_rail_mb[i] = values[i];
+            }
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_RAIL_MB"));
     add_opt(common_arg(

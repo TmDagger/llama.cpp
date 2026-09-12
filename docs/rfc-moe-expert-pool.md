@@ -81,10 +81,29 @@ thousands of times. #20757 requests a cache for exactly this.
    issues async H2D copies for misses and rewrites the map table — *before* the same
    split's input copies upload the fresh table. (This ordering is the fix described
    below; anchoring the update anywhere later lets the remap consume a stale table.)
-4. Safety rails: total pool memory is capped at half the device's free memory at load
-   time (tensors beyond the budget silently keep the selective-copy path); pools are
-   disabled under pipeline parallelism; slot-overflow is a hard assert instead of
-   silent corruption.
+4. Safety rails: pool memory is sized per device as `free VRAM - rail`, where free VRAM
+   is measured after the KV cache and model weights are already allocated (so KV is not
+   counted twice) and the rail is a per-device reserve for compute buffers
+   (`--moe-expert-cache-rail-mb`, default 1024 MiB, comma-separated per device); tensors
+   beyond the budget keep the selective-copy path; pools are disabled under pipeline
+   parallelism; slot-overflow is a hard assert instead of silent corruption.
+
+### Multi-GPU (Phase 1)
+
+With `--split-mode layer`, each layer and its experts are assigned to one device, so
+the pool for an offloaded expert tensor is placed on `model.dev_layer(il)` - the same
+device that executes the layer. This gives one independent MEC per GPU with no
+cross-device pool copies; `--moe-expert-cache-rail-mb` is per device. A single value is
+broadcast to all devices, a comma-separated list is applied in device order:
+
+```
+--mec 32 --moe-expert-cache-rail-mb 1024,512
+```
+
+Layers that run on the CPU host backend are skipped (a VRAM pool would only pull the
+`MUL_MAT_ID` off the CPU and add cross-device copies). `TENSOR`/`ROW` split (tensor
+parallelism) shards expert tensors across devices and is currently disabled with a
+warning; per-shard pools are future work.
 
 Slot sizing: `N` must cover the decode working set, not just top-k — `N = top-k` is a
 full-miss worst case and measurably *slower* than master (the per-layer id readback
@@ -160,14 +179,13 @@ to any backend, no new ops, no allocator changes.
 
 ## Limitations / future work
 
-- Single accelerator (pools go to the first device; per-layer placement is a TODO)
 - One ids readback sync per offloaded MoE layer per token — cheap when hits dominate
 - Residual near-tie divergence vs the host-copy path: perplexity-equivalent (see
   *Validation* §5); we propose treating it like the variance already accepted for
   `-ngl` changes
-- Multi-accelerator setups: pools are built on the first accelerator only; with the
-  pool engaged and layers spread across GPUs the cache now disables itself with a
-  warning (per-device pools are the planned follow-up)
+- Multi-GPU: per-device pools are supported for `--split-mode layer` (Phase 1), one
+  pool set per device placed on `model.dev_layer(il)`; `TENSOR`/`ROW` split is disabled
+  with a warning (per-shard pools are future work)
 - Platform sensitivity: on PCIe 3.0 hosts with very fast memory the break-even hit
   rate sits high (see the h* formula above) — the documentation carries the formula
   and the stats flag so users can predict engagement before spending GPU hours
@@ -181,6 +199,12 @@ cmake -B build -DGGML_CUDA=ON && cmake --build build -j
 ./build/bin/test-expert-pool                                  # bit-exact matrix
 ./build/bin/llama-bench -m <model> -ngl 99 -ncmoe 99 -mec 0,16,32,64 -n 512 -p 0
 ./build/bin/llama-cli  -m <model> -ngl 99 -cmoe -mec 32 -p <prompt> -n 128 --temp 0
+# 2 GPUs, layer split: one independent pool per device
+./build/bin/llama-server -m <model> -ngl 99 --split-mode layer -ncmoe 99 -mec 32 \
+    --moe-expert-cache-rail-mb 1024,512
+
+# per-pool hit/miss stats (every 512 updates)
+GGML_MOE_POOL_STATS=1 ./build/bin/llama-server -m <model> -ngl 99 -ncmoe 99 -mec 32
 ```
 
 ---

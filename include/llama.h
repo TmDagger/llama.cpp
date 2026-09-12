@@ -368,7 +368,7 @@ extern "C" {
         int32_t  n_threads_batch;       // number of threads to use for batch processing
         int32_t  expert_cache_slots;    // number of expert slots cached in VRAM per offloaded
                                        // MoE expert weight tensor (0 = disabled) [EXPERIMENTAL]
-        int32_t  expert_cache_rail_mb;  // VRAM reserve kept free for compute buffers (MiB) [EXPERIMENTAL]
+        const int32_t * expert_cache_rail_mb; // per-device VRAM reserve in MiB, array of llama_max_devices(); null = 1024 for all [EXPERIMENTAL]
         bool     expert_cache_legacy_kv_estimate; // subtract estimated max-context KV from the pool budget [EXPERIMENTAL]
         int32_t  expert_cache_slots_down;    // slots per down-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]
         int32_t  expert_cache_slots_gate_up; // slots per gate/up-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]

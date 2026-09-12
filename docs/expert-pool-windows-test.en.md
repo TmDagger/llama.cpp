@@ -2,12 +2,12 @@
 
 > 中文版: [expert-pool-windows-test.md](expert-pool-windows-test.md)
 
-Feature branch: `moe-expert-pool` (based on master 9723942)
+Feature branch: `fix-moe-pool-rail` (rebased on upstream master, per-device pools)
 
 Pull on Windows:
 
 ```powershell
-git clone -b moe-expert-pool https://github.com/memoriaru/llama.cpp.git
+git clone -b fix-moe-pool-rail http://192.168.0.53:8620/tmdagger/llama.cpp.git
 cd llama.cpp
 ```
 
@@ -53,10 +53,24 @@ Constraints:
 VRAM budget estimate: `offloaded MoE layers × 2–3 tensors (gate_up+down[+down]) × N ×
 bytes-per-expert`. Example: 48 layers, 128 experts, ~24 MB per Q4 expert, N = 32 →
 48×2×32×24 MB ≈ 71 GB (does not fit); N = 8 → ~18 GB. The implementation additionally
-enforces an absolute VRAM rail: the pool budget is `free VRAM at load − estimated
-max-context KV − 1 GiB`, and tensors beyond the budget fall back to the selective-copy
-path — every such skip is logged, so a partially pooled model is visible in the log
-(look for the `pooled N ... (M skipped by the VRAM rail ...)` summary line).
+enforces a per-device VRAM rail: the pool budget is `free VRAM measured after the KV
+cache and weights are allocated − rail`, and tensors beyond the budget fall back to the
+selective-copy path — every such skip is logged, so a partially pooled model is visible
+in the log (look for the `pooled N ... (M skipped by the VRAM rail ...)` summary line).
+The rail defaults to 1024 MiB and is configurable per device:
+
+```powershell
+# one value: same rail on every device
+--moe-expert-cache-rail-mb 1024
+# comma list: applied in device order
+--moe-expert-cache-rail-mb 1024,512
+```
+
+Related tuning flags: `--moe-expert-cache-down N`, `--moe-expert-cache-gate-up N`
+(per-tensor slot counts; 0 = use `-mec`), `--moe-expert-cache-warm N` (pin the first N
+experts of each pool at init; `LLAMA_MOE_POOL_UNPIN_AFTER=N` lifts the pin after N
+updates), and `--moe-expert-cache-legacy-kv-estimate` (restore the old KV-subtracting
+budget, off by default).
 
 ## Windows Build
 
@@ -130,10 +144,28 @@ fallback path; the pool is not involved).
 Multi-turn conversation for 2000+ tokens; watch for NaNs/crashes (this exercises the LRU
 eviction path). The log should show `pooled X offloaded MoE expert weight tensors`.
 
+### 5. Multi-GPU (two cards, layer split)
+
+With `--split-mode layer` the pools are per device: each GPU pools the experts of the
+layers it runs. Watch the startup log for one `expert pool budget ... on <dev>` line per
+device, one summary line per device, and confirm with `nvidia-smi` that both cards hold
+pools. A tensor that does not fit logs `... exceeds the remaining budget ...`.
+
+```powershell
+.\build\bin\Release\llama-server.exe -m <model> -ngl 99 --split-mode layer -ncmoe 99 `
+    -mec 32 --moe-expert-cache-rail-mb 1024,512
+```
+
+Compare against `-mec 0` under the same split; decode tg should improve on both devices.
+The previous `expert cache disabled: N accelerator devices present` warning must be gone.
+Layer split with `-ncmoe` keeps pipeline parallelism off (`--n-cpu-moe` adds tensor
+overrides), which is required for the pool to stay enabled.
+
 ## Known Limitations (MVP)
 
 - Disabled automatically under pipeline parallelism (warning logged)
-- Multi-GPU: pools all go to the first accelerator (TODO: pick per layer)
+- `TENSOR`/`ROW` split (tensor parallelism) is disabled with a warning; per-shard pools
+  are future work. `--split-mode layer` and `none` are supported
 - Only affects expert tensors actually placed on the host
 - One expert-id readback synchronization per offloaded MoE layer per token — cheap when
   hits dominate, a measurable tax when they don't (size `N` accordingly)

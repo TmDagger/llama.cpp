@@ -276,7 +276,12 @@ llama_context::llama_context(
     cparams.expert_cache_slots_down = params.expert_cache_slots_down;
     cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
     cparams.expert_cache_warm = params.expert_cache_warm;
-    cparams.expert_cache_rail_mb = params.expert_cache_rail_mb;
+    cparams.expert_cache_rail_mb.assign(llama_max_devices(), 1024);
+    if (params.expert_cache_rail_mb != nullptr) {
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            cparams.expert_cache_rail_mb[i] = params.expert_cache_rail_mb[i];
+        }
+    }
     cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 
     // initialized later
@@ -603,90 +608,104 @@ void llama_context::init_expert_pools() {
         return;
     }
 
-    {
-        int n_accel = 0;
-        for (const auto & b : backends) {
-            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                n_accel++;
-            }
-        }
-        if (n_accel > 1) {
-            // pools would live on the first accelerator while some layers run on
-            // others - the pooled FFNs would either migrate devices or copy the pool
-            // cross-device every step. untested and likely slower than the stock path.
-            LLAMA_LOG_WARN("%s: expert cache disabled: %d accelerator devices present, pooling currently supports exactly one\n", __func__, n_accel);
-            return;
-        }
-    }
-
-    // experts are pooled on the compute backend running the layers (the first accelerator)
-    // TODO: with multiple accelerators, pick the backend of each layer instead
-    int backend_id = -1;
-    for (size_t i = 0; i < backends.size(); ++i) {
-        if (ggml_backend_dev_type(ggml_backend_get_device(backends[i].get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            continue;
-        }
-        backend_id = i;
-        break;
-    }
-    if (backend_id < 0) {
-        LLAMA_LOG_WARN("%s: expert cache ignored: no accelerator backend found\n", __func__);
+    // Phase 1: per-device pools. Layer split assigns each layer, and with it its
+    // experts, wholesale to one device, so a per-tensor pool can live on the device
+    // that runs the layer. TENSOR/ROW split shards expert tensors across devices and
+    // would need per-shard pools - disabled for now.
+    // TODO: TENSOR/ROW support - pool a tensor only when it is fully resident on one
+    // device; this interacts with the meta backend split state (see
+    // llama_meta_device_get_split_state). Quick win candidate: dense tensors only.
+    if (model.split_mode() != LLAMA_SPLIT_MODE_LAYER && model.split_mode() != LLAMA_SPLIT_MODE_NONE) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: only layer split is supported (split_mode = %d)\n",
+                __func__, (int) model.split_mode());
         return;
     }
+
+    auto backend_id_of = [&](ggml_backend_dev_t d) -> int {
+        for (size_t i = 0; i < backends.size(); ++i) {
+            if (ggml_backend_get_device(backends[i].get()) == d) {
+                return (int) i;
+            }
+        }
+        return -1;
+    };
+
+    // per-device VRAM rail in MiB: cparams holds an array of llama_max_devices()
+    // values; a single CLI value was already broadcast across devices
+    auto rail_mb_of = [&](int backend_id) -> int32_t {
+        static const int32_t def = 1024;
+        if (cparams.expert_cache_rail_mb.empty()) {
+            return def;
+        }
+        if (backend_id >= 0 && backend_id < (int) cparams.expert_cache_rail_mb.size()) {
+            return cparams.expert_cache_rail_mb[backend_id];
+        }
+        return cparams.expert_cache_rail_mb.back();
+    };
 
     int n_pooled = 0;
     int n_skipped = 0;
 
-    // The KV cache buffer is allocated up front in the memory module constructor,
-    // so dev_free below is already post-KV. The default budget is therefore simply
-    // free VRAM minus a fixed rail for compute buffers. Otherwise a run that is
-    // fine when cold hits the paging line at depth (858 MiB free vs 775 MiB free
-    // was measured at -1% vs -11% decode and 2.3x TTFT on a 32 GB WDDM card).
-    // The legacy estimate path (off by default) subtracts an estimated
-    // max-context KV instead; it counts attention layers only at n_ctx_seq and
-    // is zero when KV lives in RAM (--no-kv-offload).
-    ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
-    size_t dev_free = 0;
-    size_t dev_total = 0;
-    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    std::vector<size_t> budget(backends.size(), 0);
+    std::vector<bool>   budget_init(backends.size(), false);
+    std::vector<int>    n_pooled_dev(backends.size(), 0);
 
-    const size_t pool_rail = (size_t) (cparams.expert_cache_rail_mb > 0 ? cparams.expert_cache_rail_mb : 0) * 1024 * 1024;
+    // The KV cache buffer is allocated up front in the memory module constructor on
+    // the layer device, so dev_free below is already post-KV and post-weights. The
+    // default budget is therefore simply free VRAM minus the per-device rail for
+    // compute buffers. Otherwise a run that is fine when cold hits the paging line
+    // at depth (858 MiB free vs 775 MiB free was measured at -1% vs -11% decode and
+    // 2.3x TTFT on a 32 GB WDDM card). The legacy estimate path (off by default)
+    // subtracts an estimated max-context KV of the layers on this device instead; it
+    // counts attention layers only at n_ctx_seq and is zero with --no-kv-offload.
+    auto ensure_budget = [&](int backend_id) {
+        if (budget_init[backend_id]) {
+            return;
+        }
+        budget_init[backend_id] = true;
 
-    size_t kv_est = 0;
-    if (cparams.expert_cache_legacy_kv_estimate) {
-        if (cparams.offload_kqv && !model.hparams.no_alloc) {
-            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-                if (model.hparams.is_recr(il)) {
-                    continue; // recurrent state is bounded, not per-token growth
+        ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
+        size_t dev_free = 0;
+        size_t dev_total = 0;
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+
+        const size_t pool_rail = (size_t) (rail_mb_of(backend_id) > 0 ? rail_mb_of(backend_id) : 0) * 1024 * 1024;
+
+        size_t kv_est = 0;
+        if (cparams.expert_cache_legacy_kv_estimate) {
+            if (cparams.offload_kqv && !model.hparams.no_alloc) {
+                for (int il = 0; il < (int) model.layers.size(); ++il) {
+                    if (model.hparams.is_recr(il)) {
+                        continue; // recurrent state is bounded, not per-token growth
+                    }
+                    if (model.dev_layer(il) != dev) {
+                        continue; // KV for this layer lives on another device
+                    }
+                    kv_est += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
+                            + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
                 }
-                kv_est += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
-                        + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
+                kv_est *= cparams.n_ctx_seq;
             }
-            kv_est *= cparams.n_ctx_seq;
+
+            budget[backend_id] = (dev_free > kv_est + pool_rail) ? (dev_free - kv_est - pool_rail) : 0;
+
+            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
+                    __func__, budget[backend_id] / 1024.0 / 1024.0 / 1024.0, ggml_backend_dev_name(dev),
+                    dev_free / 1024.0 / 1024.0 / 1024.0, kv_est / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
+        } else {
+            budget[backend_id] = (dev_free > pool_rail) ? (dev_free - pool_rail) : 0;
+
+            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB incl. preallocated KV - %.2f GiB rail)\n",
+                    __func__, budget[backend_id] / 1024.0 / 1024.0 / 1024.0, ggml_backend_dev_name(dev),
+                    dev_free / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
         }
 
-        LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
-                __func__, (dev_free > kv_est + pool_rail ? dev_free - kv_est - pool_rail : 0) / 1024.0 / 1024.0 / 1024.0,
-                dev_free / 1024.0 / 1024.0 / 1024.0,
-                kv_est / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
-    } else {
-        LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB incl. preallocated KV - %.2f GiB rail)\n",
-                __func__, (dev_free > pool_rail ? dev_free - pool_rail : 0) / 1024.0 / 1024.0 / 1024.0,
-                dev_free / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
-    }
-
-    size_t pool_budget = 0;
-    if (cparams.expert_cache_legacy_kv_estimate) {
-        pool_budget = (dev_free > kv_est + pool_rail) ? (dev_free - kv_est - pool_rail) : 0;
-    } else {
-        pool_budget = (dev_free > pool_rail) ? (dev_free - pool_rail) : 0;
-    }
-
-    if (pool_budget == 0) {
-        LLAMA_LOG_WARN("%s: expert cache disabled: free VRAM leaves less than the %.2f GiB rail%s\n",
-                __func__, pool_rail / 1024.0 / 1024.0 / 1024.0,
-                cparams.expert_cache_legacy_kv_estimate ? " after the max-context KV estimate" : "");
-    }
+        if (budget[backend_id] == 0) {
+            LLAMA_LOG_WARN("%s: expert cache disabled on %s: free VRAM leaves less than the %.2f GiB rail%s\n",
+                    __func__, ggml_backend_dev_name(dev), pool_rail / 1024.0 / 1024.0 / 1024.0,
+                    cparams.expert_cache_legacy_kv_estimate ? " after the max-context KV estimate" : "");
+        }
+    };
 
     // pool footprint on the device, mirrors the register-side allocation
     // (n_slots * expert_size + a small NaN-safe tail)
@@ -695,10 +714,24 @@ void llama_context::init_expert_pools() {
         return (size_t) n_slots * esz + std::min<size_t>(esz, 512);
     };
 
-    // pool every MoE expert weight tensor that is actually offloaded to the host; when a
-    // layer has both fused gate_up and separate gate/up tensors only the fused one is
-    // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
-    for (const auto & layer : model.layers) {
+    // pool every MoE expert weight tensor that is offloaded to the host and whose layer
+    // runs on an accelerator; when a layer has both fused gate_up and separate gate/up
+    // tensors only the fused one is used by the graph (see build_moe_ffn), so pooling
+    // the others would waste VRAM
+    for (int il = 0; il < (int) model.layers.size(); ++il) {
+        const auto & layer = model.layers[il];
+
+        ggml_backend_dev_t ldev = model.dev_layer(il);
+        if (ggml_backend_dev_type(ldev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // the whole layer runs on the CPU host backend, so a VRAM pool would only
+            // pull the MUL_MAT_ID off the CPU and add cross-device copies
+            continue;
+        }
+        const int backend_id = backend_id_of(ldev);
+        if (backend_id < 0) {
+            continue;
+        }
+
         ggml_tensor * tensors[2];
         int n_tensors = 0;
         if (layer.ffn_gate_up_exps != nullptr) {
@@ -716,6 +749,9 @@ void llama_context::init_expert_pools() {
             if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
                 continue;
             }
+
+            // lazily size this device's budget on the first offloaded expert tensor
+            ensure_budget(backend_id);
 
             // per-tensor slot count: gate/up side uses the gate_up override,
             // down side uses the down override (0 = fall back to the common N)
@@ -735,13 +771,13 @@ void llama_context::init_expert_pools() {
             }
 
             const size_t pool_size = moe_pool_footprint(w, n_slots);
-            if (pool_size > pool_budget) {
+            if (pool_size > budget[backend_id]) {
                 n_skipped++;
-                LLAMA_LOG_INFO("%s: '%s' (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
-                        __func__, w->name, n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
+                LLAMA_LOG_INFO("%s: '%s' on %s (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
+                        __func__, w->name, ggml_backend_dev_name(ldev), n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
                 continue;
             }
-            pool_budget -= pool_size;
+            budget[backend_id] -= pool_size;
 
             ggml_tensor * table = nullptr;
             ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, backend_id, n_slots, &table);
@@ -751,6 +787,7 @@ void llama_context::init_expert_pools() {
 
             expert_pools.emplace(w, llama_expert_pool{pool, table});
             n_pooled++;
+            n_pooled_dev[backend_id]++;
 
             if (cparams.expert_cache_warm > 0) {
                 const int n_pin = ggml_backend_sched_pin_expert_pool(sched.get(), pool,
@@ -763,6 +800,12 @@ void llama_context::init_expert_pools() {
     if (n_pooled > 0) {
         LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors (%d skipped by the VRAM rail - those layers run the stock host-copy path)\n",
                 __func__, n_pooled, n_skipped);
+        for (size_t i = 0; i < backends.size(); ++i) {
+            if (n_pooled_dev[i] > 0) {
+                LLAMA_LOG_INFO("%s:   %s: %d pooled tensors, %.2f GiB budget remaining\n",
+                        __func__, ggml_backend_name(backends[i].get()), n_pooled_dev[i], budget[i] / 1024.0 / 1024.0 / 1024.0);
+            }
+        }
         // decode ubatches wider than the pool fall back to the host-copy path per
         // ubatch (see build_lora_mm_id); warn when parallel decode is likely to trip it
         if (model.hparams.n_expert_used_max() > 0 && cparams.n_seq_max > 1) {
@@ -3826,7 +3869,7 @@ llama_context_params llama_context_default_params() {
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.expert_cache_slots          =*/ 0,
-        /*.expert_cache_rail_mb        =*/ 1024,
+        /*.expert_cache_rail_mb        =*/ nullptr,
         /*.expert_cache_legacy_kv_estimate =*/ false,
         /*.expert_cache_slots_down     =*/ 0,
         /*.expert_cache_slots_gate_up  =*/ 0,

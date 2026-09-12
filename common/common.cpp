@@ -1752,7 +1752,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_slots_down = params.expert_cache_slots_down;
     cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
     cparams.expert_cache_warm = params.expert_cache_warm;
-    cparams.expert_cache_rail_mb = params.expert_cache_rail_mb;
+    cparams.expert_cache_rail_mb = params.expert_cache_rail_mb.empty() ? nullptr : params.expert_cache_rail_mb.data();
     cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 
     cparams.type_k = params.cache_type_k;
