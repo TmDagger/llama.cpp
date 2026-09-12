@@ -762,7 +762,7 @@ void llama_context::init_expert_pools() {
             continue; // expert cache disabled on this device
         }
 
-        ggml_tensor * tensors[2];
+        ggml_tensor * tensors[3]; // fused gate_up + down, or up + gate + down
         int n_tensors = 0;
         if (layer.ffn_gate_up_exps != nullptr) {
             tensors[n_tensors++] = layer.ffn_gate_up_exps;
@@ -851,6 +851,9 @@ void llama_context::init_expert_pools() {
 
         for (size_t i = 0; i < plan.w.size(); ++i) {
             ggml_tensor * w = plan.w[i];
+            if (expert_pools.find(w) != expert_pools.end()) {
+                continue; // safety: never register the same tensor twice
+            }
             const int n_slots = std::max(1, (int) ((float) plan.req[i] * scale));
 
             budget[b] -= moe_pool_footprint(w, n_slots);
