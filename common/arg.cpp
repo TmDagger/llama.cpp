@@ -2782,6 +2782,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
     add_opt(common_arg(
+        {"--moe-expert-cache-rail-mb"}, "N",
+        "VRAM reserve in MiB kept free for compute buffers when sizing the MoE expert cache (default: 1024)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_rail_mb = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_RAIL_MB"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-legacy-kv-estimate"},
+        {"--no-moe-expert-cache-legacy-kv-estimate"},
+        string_format("subtract estimated max-context KV from the expert pool budget (default: %s)", params.expert_cache_legacy_kv_estimate ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.expert_cache_legacy_kv_estimate = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_LEGACY_KV_ESTIMATE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

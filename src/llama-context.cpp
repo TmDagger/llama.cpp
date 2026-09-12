@@ -273,6 +273,8 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
 
     cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_rail_mb = params.expert_cache_rail_mb;
+    cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -632,34 +634,55 @@ void llama_context::init_expert_pools() {
     int n_pooled = 0;
     int n_skipped = 0;
 
-    // the pool takes VRAM that the KV cache would otherwise grow into, so size the
-    // budget under an absolute rail: estimated max-context KV plus a fixed reserve
-    // must stay free, otherwise a run that is fine when cold hits the paging line at
-    // depth (858 MiB free vs 775 MiB free was measured at -1% vs -11% decode and
-    // 2.3x TTFT on a 32 GB WDDM card). note the estimate covers only the per-token
-    // growth (attention KV); recurrent-state and compute buffers are bounded and
-    // share the fixed reserve.
+    // The KV cache buffer is allocated up front in the memory module constructor,
+    // so dev_free below is already post-KV. The default budget is therefore simply
+    // free VRAM minus a fixed rail for compute buffers. Otherwise a run that is
+    // fine when cold hits the paging line at depth (858 MiB free vs 775 MiB free
+    // was measured at -1% vs -11% decode and 2.3x TTFT on a 32 GB WDDM card).
+    // The legacy estimate path (off by default) subtracts an estimated
+    // max-context KV instead; it counts attention layers only at n_ctx_seq and
+    // is zero when KV lives in RAM (--no-kv-offload).
     ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
     size_t dev_free = 0;
     size_t dev_total = 0;
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
 
-    size_t kv_max = 0;
-    for (int il = 0; il < (int) model.layers.size(); ++il) {
-        kv_max += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
-                + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
+    const size_t pool_rail = (size_t) (cparams.expert_cache_rail_mb > 0 ? cparams.expert_cache_rail_mb : 0) * 1024 * 1024;
+
+    size_t kv_est = 0;
+    if (cparams.expert_cache_legacy_kv_estimate) {
+        if (cparams.offload_kqv && !model.hparams.no_alloc) {
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (model.hparams.is_recr(il)) {
+                    continue; // recurrent state is bounded, not per-token growth
+                }
+                kv_est += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
+                        + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
+            }
+            kv_est *= cparams.n_ctx_seq;
+        }
+
+        LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
+                __func__, (dev_free > kv_est + pool_rail ? dev_free - kv_est - pool_rail : 0) / 1024.0 / 1024.0 / 1024.0,
+                dev_free / 1024.0 / 1024.0 / 1024.0,
+                kv_est / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
+    } else {
+        LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB incl. preallocated KV - %.2f GiB rail)\n",
+                __func__, (dev_free > pool_rail ? dev_free - pool_rail : 0) / 1024.0 / 1024.0 / 1024.0,
+                dev_free / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
     }
-    kv_max *= cparams.n_ctx;
 
-    constexpr size_t pool_rail = 1024ull * 1024 * 1024; // keep >= 1 GiB free at max context
-    size_t pool_budget = (dev_free > kv_max + pool_rail) ? (dev_free - kv_max - pool_rail) : 0;
+    size_t pool_budget = 0;
+    if (cparams.expert_cache_legacy_kv_estimate) {
+        pool_budget = (dev_free > kv_est + pool_rail) ? (dev_free - kv_est - pool_rail) : 0;
+    } else {
+        pool_budget = (dev_free > pool_rail) ? (dev_free - pool_rail) : 0;
+    }
 
-    LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
-            __func__, pool_budget / 1024.0 / 1024.0 / 1024.0, dev_free / 1024.0 / 1024.0 / 1024.0,
-            kv_max / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
     if (pool_budget == 0) {
-        LLAMA_LOG_WARN("%s: expert cache disabled: free VRAM minus max-context KV leaves less than the %.2f GiB rail\n",
-                __func__, pool_rail / 1024.0 / 1024.0 / 1024.0);
+        LLAMA_LOG_WARN("%s: expert cache disabled: free VRAM leaves less than the %.2f GiB rail%s\n",
+                __func__, pool_rail / 1024.0 / 1024.0 / 1024.0,
+                cparams.expert_cache_legacy_kv_estimate ? " after the max-context KV estimate" : "");
     }
 
     // pool every MoE expert weight tensor that is actually offloaded to the host; when a
@@ -3770,6 +3793,8 @@ llama_context_params llama_context_default_params() {
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.expert_cache_slots          =*/ 0,
+        /*.expert_cache_rail_mb        =*/ 1024,
+        /*.expert_cache_legacy_kv_estimate =*/ false,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

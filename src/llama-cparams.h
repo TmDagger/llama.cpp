@@ -23,6 +23,10 @@ struct llama_cparams {
 
     // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
     int32_t  expert_cache_slots = 0;
+    // VRAM reserve kept free for compute buffers (MiB)
+    int32_t  expert_cache_rail_mb = 1024;
+    // subtract estimated max-context KV from the pool budget (legacy, off by default)
+    bool     expert_cache_legacy_kv_estimate = false;
 
     float rope_freq_base;
     float rope_freq_scale;
