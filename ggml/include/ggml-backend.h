@@ -386,6 +386,24 @@ extern "C" {
         struct ggml_tensor   * pool,
         int                    n);
 
+    // Aggregated runtime stats of all registered expert pools (debug/telemetry).
+    // Per-backend arrays are indexed by backend id; valid entries are [0, n_backends).
+    #define GGML_SCHED_MAX_EXPERT_POOL_BACKENDS 16
+    struct ggml_backend_sched_expert_pool_stats {
+        uint64_t n_hits;
+        uint64_t n_misses;
+        int      n_pools;
+        int      n_slots;
+        int      n_free;
+        int      n_backends;
+        uint64_t hits  [GGML_SCHED_MAX_EXPERT_POOL_BACKENDS];
+        uint64_t misses[GGML_SCHED_MAX_EXPERT_POOL_BACKENDS];
+    };
+
+    GGML_API void ggml_backend_sched_get_expert_pool_stats(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_expert_pool_stats * stats);
+
     //
     // Meta backend
     //

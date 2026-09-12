@@ -2770,15 +2770,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"-mec", "--moe-expert-cache"}, "N",
+        {"-mec", "--moe-expert-cache"}, "N0,N1,...",
         "keep a cache of N experts per offloaded MoE weight tensor in VRAM\n"
         "hot experts are served from VRAM across decode steps, only cache misses are\n"
-        "copied from the CPU (requires --cpu-moe/--n-cpu-moe or tensor overrides, 0 = off)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        "copied from the CPU (requires --cpu-moe/--n-cpu-moe or tensor overrides, 0 = off)\n"
+        "comma-separated N per device in device order, a single value is broadcast",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices()));
             }
-            params.expert_cache_slots = value;
+            std::vector<int32_t> values;
+            values.reserve(split_arg.size());
+            for (const auto & s : split_arg) {
+                const int32_t v = std::stoi(s);
+                if (v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                values.push_back(v);
+            }
+            if (values.size() == 1) {
+                params.expert_cache_slots = values[0];
+                params.expert_cache_slots_per_dev.clear();
+                return;
+            }
+            params.expert_cache_slots = *std::max_element(values.begin(), values.end());
+            params.expert_cache_slots_per_dev.assign(llama_max_devices(), values.back());
+            for (size_t i = 0; i < values.size(); i++) {
+                params.expert_cache_slots_per_dev[i] = values[i];
+            }
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
     add_opt(common_arg(

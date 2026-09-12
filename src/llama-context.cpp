@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -273,6 +274,14 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
 
     cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_slots_per_dev.assign(llama_max_devices(), params.expert_cache_slots);
+    if (params.expert_cache_slots_per_dev != nullptr) {
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            cparams.expert_cache_slots_per_dev[i] = params.expert_cache_slots_per_dev[i];
+        }
+        cparams.expert_cache_slots = *std::max_element(
+                cparams.expert_cache_slots_per_dev.begin(), cparams.expert_cache_slots_per_dev.end());
+    }
     cparams.expert_cache_slots_down = params.expert_cache_slots_down;
     cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
     cparams.expert_cache_warm = params.expert_cache_warm;
@@ -630,6 +639,17 @@ void llama_context::init_expert_pools() {
         return -1;
     };
 
+    // per-device slot count: a comma-separated -mec broadcasts or overrides per device
+    auto slots_of = [&](int backend_id) -> int32_t {
+        if (cparams.expert_cache_slots_per_dev.empty()) {
+            return cparams.expert_cache_slots;
+        }
+        if (backend_id >= 0 && backend_id < (int) cparams.expert_cache_slots_per_dev.size()) {
+            return cparams.expert_cache_slots_per_dev[backend_id];
+        }
+        return cparams.expert_cache_slots_per_dev.back();
+    };
+
     // per-device VRAM rail in MiB: cparams holds an array of llama_max_devices()
     // values; a single CLI value was already broadcast across devices
     auto rail_mb_of = [&](int backend_id) -> int32_t {
@@ -754,11 +774,15 @@ void llama_context::init_expert_pools() {
             ensure_budget(backend_id);
 
             // per-tensor slot count: gate/up side uses the gate_up override,
-            // down side uses the down override (0 = fall back to the common N)
+            // down side uses the down override (0 = fall back to the per-device -mec)
+            const int32_t slots_dev = slots_of(backend_id);
+            if (slots_dev <= 0) {
+                continue; // expert cache disabled on this device
+            }
             const bool is_gate_up = (w == layer.ffn_gate_up_exps || w == layer.ffn_up_exps || w == layer.ffn_gate_exps);
             const int32_t base_slots = is_gate_up
-                ? (cparams.expert_cache_slots_gate_up > 0 ? cparams.expert_cache_slots_gate_up : cparams.expert_cache_slots)
-                : (cparams.expert_cache_slots_down   > 0 ? cparams.expert_cache_slots_down   : cparams.expert_cache_slots);
+                ? (cparams.expert_cache_slots_gate_up > 0 ? cparams.expert_cache_slots_gate_up : slots_dev)
+                : (cparams.expert_cache_slots_down   > 0 ? cparams.expert_cache_slots_down   : slots_dev);
 
             const int n_expert = (int) w->ne[2];
             if (base_slots >= n_expert) {
@@ -3869,6 +3893,7 @@ llama_context_params llama_context_default_params() {
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.expert_cache_slots          =*/ 0,
+        /*.expert_cache_slots_per_dev  =*/ nullptr,
         /*.expert_cache_rail_mb        =*/ nullptr,
         /*.expert_cache_legacy_kv_estimate =*/ false,
         /*.expert_cache_slots_down     =*/ 0,
@@ -4156,6 +4181,28 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+void llama_get_expert_pool_stats(const struct llama_context * ctx, struct llama_expert_pool_stats * stats) {
+    if (!ctx || !stats) {
+        return;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    struct ggml_backend_sched_expert_pool_stats g;
+    ggml_backend_sched_get_expert_pool_stats(ctx->get_sched(), &g);
+
+    stats->n_hits    = g.n_hits;
+    stats->n_misses  = g.n_misses;
+    stats->n_pools   = g.n_pools;
+    stats->n_devices = g.n_backends;
+
+    const int n = g.n_backends < LLAMA_EXPERT_POOL_MAX_DEVICES ? g.n_backends : LLAMA_EXPERT_POOL_MAX_DEVICES;
+    for (int i = 0; i < n; ++i) {
+        stats->hits[i]   = g.hits[i];
+        stats->misses[i] = g.misses[i];
+    }
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

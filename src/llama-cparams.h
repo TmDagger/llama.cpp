@@ -23,6 +23,8 @@ struct llama_cparams {
 
     // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
     int32_t  expert_cache_slots = 0;
+    // per-device slot counts (overrides expert_cache_slots when non-empty)
+    std::vector<int32_t> expert_cache_slots_per_dev;
     // per-device VRAM reserve kept free for compute buffers (MiB)
     std::vector<int32_t> expert_cache_rail_mb;
     // subtract estimated max-context KV from the pool budget (legacy, off by default)

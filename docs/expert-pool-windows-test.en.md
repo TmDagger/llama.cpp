@@ -57,13 +57,17 @@ enforces a per-device VRAM rail: the pool budget is `free VRAM measured after th
 cache and weights are allocated − rail`, and tensors beyond the budget fall back to the
 selective-copy path — every such skip is logged, so a partially pooled model is visible
 in the log (look for the `pooled N ... (M skipped by the VRAM rail ...)` summary line).
-The rail defaults to 1024 MiB and is configurable per device:
+The rail defaults to 1024 MiB and is configurable per device. The slot count `-mec`
+takes the same per-device list form (device order), so a card with more free memory can
+keep a larger hot set:
 
 ```powershell
 # one value: same rail on every device
 --moe-expert-cache-rail-mb 1024
 # comma list: applied in device order
 --moe-expert-cache-rail-mb 1024,512
+# per-device slot counts; a device with -mec 0 gets no pool
+-mec 48,64
 ```
 
 Related tuning flags: `--moe-expert-cache-down N`, `--moe-expert-cache-gate-up N`
@@ -153,13 +157,18 @@ pools. A tensor that does not fit logs `... exceeds the remaining budget ...`.
 
 ```powershell
 .\build\bin\Release\llama-server.exe -m <model> -ngl 99 --split-mode layer -ncmoe 99 `
-    -mec 32 --moe-expert-cache-rail-mb 1024,512
+    -mec 48,64 --moe-expert-cache-rail-mb 1024,512
 ```
 
 Compare against `-mec 0` under the same split; decode tg should improve on both devices.
 The previous `expert cache disabled: N accelerator devices present` warning must be gone.
 Layer split with `-ncmoe` keeps pipeline parallelism off (`--n-cpu-moe` adds tensor
 overrides), which is required for the pool to stay enabled.
+
+To see whether every device is actually serving its pool, run with `GGML_MOE_POOL_STATS=1`:
+the server appends a windowed hit-rate aggregate to each periodic `n_gen = ... tg = ...`
+line (total and `d0=..% d1=..%`), and the scheduler logs per-pool hit/miss every 512
+updates. A device with no `dN=` entry in the window is not serving decode hits.
 
 ## Known Limitations (MVP)
 

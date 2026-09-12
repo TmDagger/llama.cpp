@@ -368,6 +368,7 @@ extern "C" {
         int32_t  n_threads_batch;       // number of threads to use for batch processing
         int32_t  expert_cache_slots;    // number of expert slots cached in VRAM per offloaded
                                        // MoE expert weight tensor (0 = disabled) [EXPERIMENTAL]
+        const int32_t * expert_cache_slots_per_dev; // per-device slot counts, array of llama_max_devices(); null = use expert_cache_slots for all [EXPERIMENTAL]
         const int32_t * expert_cache_rail_mb; // per-device VRAM reserve in MiB, array of llama_max_devices(); null = 1024 for all [EXPERIMENTAL]
         bool     expert_cache_legacy_kv_estimate; // subtract estimated max-context KV from the pool budget [EXPERIMENTAL]
         int32_t  expert_cache_slots_down;    // slots per down-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]
@@ -588,6 +589,20 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+
+    // Aggregated runtime stats of the MoE expert pools (debug/telemetry).
+    // Per-device arrays are indexed by backend id (GPU devices first); valid entries are [0, n_devices).
+    #define LLAMA_EXPERT_POOL_MAX_DEVICES 16
+    struct llama_expert_pool_stats {
+        uint64_t n_hits;
+        uint64_t n_misses;
+        int      n_pools;
+        int      n_devices;
+        uint64_t hits  [LLAMA_EXPERT_POOL_MAX_DEVICES];
+        uint64_t misses[LLAMA_EXPERT_POOL_MAX_DEVICES];
+    };
+
+    LLAMA_API void llama_get_expert_pool_stats(const struct llama_context * ctx, struct llama_expert_pool_stats * stats);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);

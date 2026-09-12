@@ -2278,6 +2278,36 @@ int ggml_backend_sched_pin_expert_pool(
     return 0;
 }
 
+void ggml_backend_sched_get_expert_pool_stats(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_expert_pool_stats * stats) {
+    GGML_ASSERT(sched != NULL);
+    if (stats == NULL) {
+        return;
+    }
+    memset(stats, 0, sizeof(*stats));
+
+    stats->n_backends = sched->n_backends < GGML_SCHED_MAX_EXPERT_POOL_BACKENDS ? sched->n_backends : GGML_SCHED_MAX_EXPERT_POOL_BACKENDS;
+
+    for (const auto & ep : sched->expert_pools) {
+        stats->n_hits   += ep.n_hits;
+        stats->n_misses += ep.n_misses;
+        stats->n_pools  += 1;
+        stats->n_slots  += ep.n_slots;
+        stats->n_free   += ep.n_free;
+
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (sched->backends[b] == ep.backend) {
+                if (b < GGML_SCHED_MAX_EXPERT_POOL_BACKENDS) {
+                    stats->hits[b]   += ep.n_hits;
+                    stats->misses[b] += ep.n_misses;
+                }
+                break;
+            }
+        }
+    }
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,

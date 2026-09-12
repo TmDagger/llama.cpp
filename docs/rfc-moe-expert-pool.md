@@ -93,17 +93,25 @@ thousands of times. #20757 requests a cache for exactly this.
 With `--split-mode layer`, each layer and its experts are assigned to one device, so
 the pool for an offloaded expert tensor is placed on `model.dev_layer(il)` - the same
 device that executes the layer. This gives one independent MEC per GPU with no
-cross-device pool copies; `--moe-expert-cache-rail-mb` is per device. A single value is
-broadcast to all devices, a comma-separated list is applied in device order:
+cross-device pool copies. Both the slot count and the rail are per device: a single
+value is broadcast to all devices, a comma-separated list is applied in device order.
 
 ```
---mec 32 --moe-expert-cache-rail-mb 1024,512
+--mec 48,64 --moe-expert-cache-rail-mb 1024,512
 ```
+
+Per-device slot counts let a device with more free memory keep a larger hot set. Set a
+device's `-mec` to 0 to disable the pool on that device only.
 
 Layers that run on the CPU host backend are skipped (a VRAM pool would only pull the
 `MUL_MAT_ID` off the CPU and add cross-device copies). `TENSOR`/`ROW` split (tensor
 parallelism) shards expert tensors across devices and is currently disabled with a
 warning; per-shard pools are future work.
+
+Runtime telemetry: with `GGML_MOE_POOL_STATS=1` `llama-server` appends a windowed
+aggregate of the MoE pool hit rate (total and per device) to its periodic
+`n_gen = ... tg = ...` line, and the scheduler logs per-pool hit/miss every 512
+updates. This makes it visible whether every device is actually serving its pool.
 
 Slot sizing: `N` must cover the decode working set, not just top-k — `N = top-k` is a
 full-miss worst case and measurably *slower* than master (the per-layer id readback

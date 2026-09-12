@@ -613,6 +613,40 @@ struct server_slot {
         n_gen_last = stats.n_gen;
 
         SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
+
+        // MoE expert pool window stats next to the generation rate (debug):
+        // GGML_MOE_POOL_STATS=1 also enables the per-pool scheduler logs
+        if (getenv("GGML_MOE_POOL_STATS") != nullptr && ctx_tgt != nullptr) {
+            struct llama_expert_pool_stats s;
+            llama_get_expert_pool_stats(ctx_tgt, &s);
+
+            static uint64_t hits_last  [LLAMA_EXPERT_POOL_MAX_DEVICES] = {0};
+            static uint64_t misses_last[LLAMA_EXPERT_POOL_MAX_DEVICES] = {0};
+            static uint64_t hits_tot_last   = 0;
+            static uint64_t misses_tot_last = 0;
+
+            const uint64_t dh = s.n_hits   - hits_tot_last;
+            const uint64_t dm = s.n_misses - misses_tot_last;
+            hits_tot_last   = s.n_hits;
+            misses_tot_last = s.n_misses;
+
+            std::string dev;
+            for (int i = 0; i < s.n_devices && i < LLAMA_EXPERT_POOL_MAX_DEVICES; ++i) {
+                const uint64_t dhi = s.hits[i]   - hits_last[i];
+                const uint64_t dmi = s.misses[i] - misses_last[i];
+                hits_last[i]   = s.hits[i];
+                misses_last[i] = s.misses[i];
+                if (dhi + dmi == 0) {
+                    continue;
+                }
+                dev += string_format(" d%d=%.0f%%", i, 100.0*(double)dhi/(double)(dhi + dmi));
+            }
+
+            if (dh + dm > 0) {
+                SLT_INF(*this, "moe expert pool: hit %.1f%% (%llu hits / %llu misses) in window%s\n",
+                        100.0*(double)dh/(double)(dh + dm), (unsigned long long) dh, (unsigned long long) dm, dev.c_str());
+            }
+        }
     }
 
     void print_timings_pp() const {
