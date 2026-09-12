@@ -1,8 +1,10 @@
 // tests that the persistent expert pool (ggml_backend_sched_register_expert_pool) serves
 // GGML_OP_MUL_MAT_ID results identical to the regular host weight copy path
 //
-// matrix: quant type (Q2_K/Q3_K/Q4_K/Q6_K/Q8_0) x n_tokens (1/3) x two pools sharing one
-// routing (like fused gate_up + down MoE layers) x cold/evict/hit/graph-rebuild rounds.
+// matrix: quant type (Q2_K/Q3_K/Q4_K/Q6_K/Q8_0/MXFP4) x n_tokens (1/3/8; nt=8 forces
+// the CUDA MMQ mul_mat_id path incl. the Blackwell native FP4 kernels) x two pools
+// sharing one routing (like fused gate_up + down MoE layers) x cold/evict/hit/graph-rebuild
+// rounds.
 // the expert id backing store lives on the accelerator, like the router output of a real
 // model; the reference and pooled MUL_MAT_ID run in the same graph and must match
 // bit-exact.
@@ -17,12 +19,14 @@
 #include <vector>
 
 // per-case geometry (n_in must be a multiple of the largest quant block size)
+// n_tokens goes up to 8 so that n_tokens > 7 forces the CUDA MMQ mul_mat_id path
+// (decode batches use the mmvq path; MXFP4/NVFP4 mmvq-mmid max batch is 7)
 static const int n_in     = 512;
 static const int n_out    = 64;
-static const int n_expert = 8;
-static const int n_slots  = 6;  // >= n_used * n_tokens so that the pool path is taken
+static const int n_expert = 32;
+static const int n_slots  = 16; // >= n_used * n_tokens so that the pool path is taken
 static const int n_used   = 2;
-static const int n_tokens_max = 3;
+static const int n_tokens_max = 8;
 
 struct tensors {
     ggml_tensor * x = nullptr;      // [n_in, n_tokens_max] F32 host input
@@ -237,30 +241,44 @@ int main() {
             return 1;
         }
 
-        for (int n_tokens : { 1, n_tokens_max }) {
+        for (int n_tokens : { 1, 3, n_tokens_max }) {
             ggml_init_params gp = { 64 * ggml_tensor_overhead() + 8 * ggml_graph_overhead(), NULL, true };
             ggml_context * gctx = ggml_init(gp);
 
             char label[128];
             bool ok = true;
 
-            // round 1: cold pool, experts 0..3 are loaded
+            // n_tokens > 7 exceeds the mmvq mul_mat_id batch limit and exercises the CUDA
+            // MMQ ids path (Blackwell: the native FP4 MMA kernels); the nt=8 rounds also
+            // drive the pool through a full fill and a full eviction, 16 distinct experts
+            // per ubatch
+            const bool mmq_case = n_tokens > 7;
+
+            // round 1: cold pool, low experts are loaded
             snprintf(label, sizeof(label), "%s nt=%d round1 (cold)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens, {0, 1, 2, 1, 3, 0}, label);
+            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+                    mmq_case ? std::vector<int32_t>{0,1, 2,3, 4,5, 6,7, 8,9, 10,11, 12,13, 14,15}
+                             : std::vector<int32_t>{0, 1, 2, 1, 3, 0}, label);
 
-            // round 2: experts 4..7 miss and evict everything
+            // round 2: unseen experts miss and evict everything
             snprintf(label, sizeof(label), "%s nt=%d round2 (full eviction)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens, {4, 5, 6, 4, 7, 5}, label);
+            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+                    mmq_case ? std::vector<int32_t>{16,17, 18,19, 20,21, 22,23, 24,25, 26,27, 28,29, 30,31}
+                             : std::vector<int32_t>{4, 5, 6, 4, 7, 5}, label);
 
-            // round 3: expert 4 is a hit, 0 and 1 were evicted and must be reloaded
+            // round 3: hits plus evicted-expert reloads
             snprintf(label, sizeof(label), "%s nt=%d round3 (hit + reload)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens, {4, 0, 1, 4, 0, 1}, label);
+            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+                    mmq_case ? std::vector<int32_t>{16,17, 0,1, 2,3, 16,17, 0,1, 2,3, 16,17, 0,1}
+                             : std::vector<int32_t>{4, 0, 1, 4, 0, 1}, label);
 
             // rebuild the graph with fresh tensors: pool contents and bookkeeping must survive
             ggml_free(gctx);
             gctx = ggml_init(gp);
             snprintf(label, sizeof(label), "%s nt=%d round4 (after graph rebuild)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens, {2, 3, 2, 3, 2, 3}, label);
+            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+                    mmq_case ? std::vector<int32_t>{4,5, 4,5, 6,7, 6,7, 4,5, 4,5, 6,7, 6,7}
+                             : std::vector<int32_t>{2, 3, 2, 3, 2, 3}, label);
 
             if (!ok) {
                 n_failed++;
