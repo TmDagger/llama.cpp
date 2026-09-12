@@ -2808,7 +2808,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-expert-cache-rail-mb"}, "MiB0,MiB1,...",
         "per-device VRAM reserve in MiB kept free for compute buffers when sizing the MoE expert cache; "
-        "comma-separated, a single value is broadcast across all devices (default: 1024)",
+        "comma-separated, a single value is broadcast across all devices (default: 512)",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
             const std::regex regex{ R"([,/]+)" };

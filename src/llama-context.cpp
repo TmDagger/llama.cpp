@@ -285,7 +285,7 @@ llama_context::llama_context(
     cparams.expert_cache_slots_down = params.expert_cache_slots_down;
     cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
     cparams.expert_cache_warm = params.expert_cache_warm;
-    cparams.expert_cache_rail_mb.assign(llama_max_devices(), 1024);
+    cparams.expert_cache_rail_mb.assign(llama_max_devices(), 512);
     if (params.expert_cache_rail_mb != nullptr) {
         for (size_t i = 0; i < llama_max_devices(); ++i) {
             cparams.expert_cache_rail_mb[i] = params.expert_cache_rail_mb[i];
@@ -603,7 +603,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
-void llama_context::init_expert_pools() {
+void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserve) {
     expert_pools.clear();
 
     if (cparams.expert_cache_slots <= 0) {
@@ -653,7 +653,7 @@ void llama_context::init_expert_pools() {
     // per-device VRAM rail in MiB: cparams holds an array of llama_max_devices()
     // values; a single CLI value was already broadcast across devices
     auto rail_mb_of = [&](int backend_id) -> int32_t {
-        static const int32_t def = 1024;
+        static const int32_t def = 512;
         if (cparams.expert_cache_rail_mb.empty()) {
             return def;
         }
@@ -690,6 +690,10 @@ void llama_context::init_expert_pools() {
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
 
         const size_t pool_rail = (size_t) (rail_mb_of(backend_id) > 0 ? rail_mb_of(backend_id) : 0) * 1024 * 1024;
+        // worst-case compute buffer measured before the pools were allocated; it must
+        // stay free or graph_reserve fails after the pools have taken the VRAM
+        const size_t compute = backend_id < (int) compute_reserve.size() ? compute_reserve[backend_id] : 0;
+        const size_t reserved = pool_rail + compute;
 
         size_t kv_est = 0;
         if (cparams.expert_cache_legacy_kv_estimate) {
@@ -707,21 +711,22 @@ void llama_context::init_expert_pools() {
                 kv_est *= cparams.n_ctx_seq;
             }
 
-            budget[backend_id] = (dev_free > kv_est + pool_rail) ? (dev_free - kv_est - pool_rail) : 0;
+            budget[backend_id] = (dev_free > kv_est + reserved) ? (dev_free - kv_est - reserved) : 0;
 
-            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
+            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB - max-context KV %.2f GiB - compute %.2f GiB - %.2f GiB rail)\n",
                     __func__, budget[backend_id] / 1024.0 / 1024.0 / 1024.0, ggml_backend_dev_name(dev),
-                    dev_free / 1024.0 / 1024.0 / 1024.0, kv_est / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
+                    dev_free / 1024.0 / 1024.0 / 1024.0, kv_est / 1024.0 / 1024.0 / 1024.0,
+                    compute / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
         } else {
-            budget[backend_id] = (dev_free > pool_rail) ? (dev_free - pool_rail) : 0;
+            budget[backend_id] = (dev_free > reserved) ? (dev_free - reserved) : 0;
 
-            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB incl. preallocated KV - %.2f GiB rail)\n",
+            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB incl. preallocated KV - compute %.2f GiB - %.2f GiB rail)\n",
                     __func__, budget[backend_id] / 1024.0 / 1024.0 / 1024.0, ggml_backend_dev_name(dev),
-                    dev_free / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
+                    dev_free / 1024.0 / 1024.0 / 1024.0, compute / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
         }
 
         if (budget[backend_id] == 0) {
-            LLAMA_LOG_WARN("%s: expert cache disabled on %s: free VRAM leaves less than the %.2f GiB rail%s\n",
+            LLAMA_LOG_WARN("%s: expert cache disabled on %s: free VRAM leaves less than the compute reserve plus the %.2f GiB rail%s\n",
                     __func__, ggml_backend_dev_name(dev), pool_rail / 1024.0 / 1024.0 / 1024.0,
                     cparams.expert_cache_legacy_kv_estimate ? " after the max-context KV estimate" : "");
         }
@@ -929,8 +934,6 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
-    init_expert_pools();
-
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -945,6 +948,35 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
+    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    // Measure the worst-case compute buffers (pp and tg) with the pools disabled so the
+    // pool budget can keep that memory free; otherwise the pools can fill VRAM and the
+    // subsequent graph_reserve fails to allocate the pp buffer. The pp graph falls back
+    // to the host-copy path anyway, so its size does not depend on the pools.
+    auto measure_compute_reserve = [&]() -> std::vector<size_t> {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        expert_pools.clear();
+
+        std::vector<size_t> cur(backend_ptrs.size(), 0);
+        if (graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, cur.data())) {
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                sizes[i] = std::max(sizes[i], cur[i]);
+            }
+        }
+        std::fill(cur.begin(), cur.end(), 0);
+        if (graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true, cur.data())) {
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                sizes[i] = std::max(sizes[i], cur[i]);
+            }
+        }
+        return sizes;
+    };
+
+    const std::vector<size_t> compute_reserve = measure_compute_reserve();
+
+    init_expert_pools(compute_reserve);
+
     resolve_fused_ops(mctx.get(), n_seqs);
 
     // reserve worst-case graph
@@ -953,8 +985,6 @@ void llama_context::sched_reserve() {
 
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
-
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -965,7 +995,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                init_expert_pools();
+                init_expert_pools(compute_reserve);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

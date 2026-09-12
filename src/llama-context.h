@@ -263,8 +263,10 @@ private:
     llm_graph_cb graph_get_cb() const;
 
     // register persistent VRAM expert slot pools for the offloaded MoE expert weight tensors
-    // (cparams.expert_cache_slots > 0), called once after the scheduler is created
-    void init_expert_pools();
+    // (cparams.expert_cache_slots > 0), called once after the scheduler is created.
+    // compute_reserve is the per-backend worst-case compute buffer size, measured before
+    // allocating the pools, so the pool budget can keep that memory free.
+    void init_expert_pools(const std::vector<size_t> & compute_reserve);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)

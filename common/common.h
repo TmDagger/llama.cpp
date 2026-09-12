@@ -474,7 +474,7 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     int32_t expert_cache_slots = 0;     // expert slots cached in VRAM per offloaded MoE weight tensor
     std::vector<int32_t> expert_cache_slots_per_dev; // per-device slot counts (empty = broadcast expert_cache_slots)
-    std::vector<int32_t> expert_cache_rail_mb = std::vector<int32_t>(llama_max_devices(), 1024); // per-device VRAM reserve (MiB)
+    std::vector<int32_t> expert_cache_rail_mb = std::vector<int32_t>(llama_max_devices(), 512); // per-device VRAM reserve (MiB)
     bool    expert_cache_legacy_kv_estimate = false; // subtract estimated max-context KV from pool budget
     int32_t expert_cache_slots_down = 0;    // slots per down-expert tensor (0 = use expert_cache_slots)
     int32_t expert_cache_slots_gate_up = 0; // slots per gate/up-expert tensor (0 = use expert_cache_slots)

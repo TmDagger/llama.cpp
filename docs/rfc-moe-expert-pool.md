@@ -81,15 +81,17 @@ thousands of times. #20757 requests a cache for exactly this.
    issues async H2D copies for misses and rewrites the map table — *before* the same
    split's input copies upload the fresh table. (This ordering is the fix described
    below; anchoring the update anywhere later lets the remap consume a stale table.)
-4. Safety rails: pool memory is sized per device as `free VRAM - rail`, where free VRAM
-   is measured after the KV cache and model weights are already allocated (so KV is not
-   counted twice) and the rail is a per-device reserve for compute buffers
-   (`--moe-expert-cache-rail-mb`, default 1024 MiB, comma-separated per device). If the
-   requested slots do not fit, every tensor on that device is scaled down uniformly
-   instead of pooling some layers and dropping the rest to the host path; only if even
-   one slot per tensor does not fit is the device left on the selective-copy path.
-   Pools are disabled under pipeline parallelism; slot-overflow is a hard assert instead
-   of silent corruption.
+4. Safety rails: pool memory is sized per device as
+   `free VRAM - worst-case compute buffer - rail`, where free VRAM is measured after the
+   KV cache and model weights are already allocated (so KV is not counted twice), the
+   compute buffer (pp/tg) is measured without allocating via
+   `ggml_backend_sched_reserve_size` before the pools are created, and the rail is a
+   per-device margin on top (`--moe-expert-cache-rail-mb`, default 512 MiB,
+   comma-separated per device). If the requested slots do not fit, every tensor on that
+   device is scaled down uniformly instead of pooling some layers and dropping the rest
+   to the host path; only if even one slot per tensor does not fit is the device left on
+   the selective-copy path. Pools are disabled under pipeline parallelism; slot-overflow
+   is a hard assert instead of silent corruption.
 
 ### Multi-GPU (Phase 1)
 
