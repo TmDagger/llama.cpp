@@ -1,4 +1,6 @@
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -27,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__APPLE__) && defined(__MACH__)
@@ -1289,6 +1292,8 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    common_params_apply_layer_split_strategy(params);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1302,6 +1307,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
         common_params params_dft = common_base_params_to_speculative(params);
+        common_params_apply_layer_split_strategy(params_dft);
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -1675,6 +1681,153 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     }
 
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+}
+
+// short device-to-device copy benchmark; returns 0 on failure
+static float common_backend_mem_bw_gbps(ggml_backend_dev_t dev) {
+    const size_t size   = 256ull * 1024 * 1024; // 256 MiB
+    const int    n_iter = 16;
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (backend == nullptr) {
+        return 0.0f;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    struct ggml_init_params ip = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, size);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, size);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
+    ggml_backend_tensor_copy(a, b); // warmup
+    ggml_backend_synchronize(backend);
+
+    const int64_t t0 = ggml_time_us();
+    for (int i = 0; i < n_iter; ++i) {
+        ggml_backend_tensor_copy(a, b);
+    }
+    ggml_backend_synchronize(backend);
+    const int64_t t1 = ggml_time_us();
+
+    const double seconds = (t1 - t0) / 1e6;
+    const double bytes   = 2.0 * (double) size * n_iter; // read + write
+    const float  gbps    = seconds > 0.0 ? (float) (bytes / seconds / 1e9) : 0.0f;
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    return gbps;
+}
+
+std::vector<ggml_backend_dev_t> common_params_offload_devices(const common_params & params) {
+    if (!params.devices.empty()) {
+        return params.devices;
+    }
+
+    // mirror the default device selection in llama_prepare_model_devices: RPC servers
+    // first, then discrete GPUs; integrated GPUs only if there are no discrete ones
+    std::vector<ggml_backend_dev_t> rpc;
+    std::vector<ggml_backend_dev_t> gpus;
+    std::vector<ggml_backend_dev_t> igpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+                break;
+            case GGML_BACKEND_DEVICE_TYPE_GPU: {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (ggml_backend_reg_name(reg) == std::string("RPC")) {
+                    rpc.push_back(dev);
+                } else {
+                    ggml_backend_dev_props props;
+                    ggml_backend_dev_get_props(dev, &props);
+                    bool dup = false;
+                    for (ggml_backend_dev_t d : gpus) {
+                        ggml_backend_dev_props d_props;
+                        ggml_backend_dev_get_props(d, &d_props);
+                        if (props.device_id && d_props.device_id && strcmp(props.device_id, d_props.device_id) == 0) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        gpus.push_back(dev);
+                    }
+                }
+            } break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU: {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (igpus.empty() || reg == ggml_backend_dev_backend_reg(igpus.back())) {
+                    igpus.push_back(dev);
+                }
+            } break;
+            case GGML_BACKEND_DEVICE_TYPE_META:
+                break;
+        }
+    }
+
+    std::vector<ggml_backend_dev_t> res = rpc;
+    res.insert(res.end(), gpus.begin(), gpus.end());
+    if (gpus.empty()) {
+        res.insert(res.end(), igpus.begin(), igpus.end());
+    }
+    return res;
+}
+
+void common_params_apply_layer_split_strategy(common_params & params) {
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+        return;
+    }
+    if (params.layer_split_strategy == COMMON_LAYER_SPLIT_STRATEGY_MANUAL) {
+        return; // --tensor-split already holds the proportions
+    }
+
+    const std::vector<ggml_backend_dev_t> devs = common_params_offload_devices(params);
+    if (devs.empty()) {
+        return;
+    }
+
+    std::vector<float> shares(devs.size(), 1.0f);
+
+    if (params.layer_split_strategy == COMMON_LAYER_SPLIT_STRATEGY_EQ) {
+        COM_INF("%s: layer split strategy 'eq' over %zu devices\n", __func__, devs.size());
+    } else {
+        // measure the bandwidth once per device per process
+        static std::unordered_map<ggml_backend_dev_t, float> bw_cache;
+
+        COM_INF("%s: layer split strategy 'bw':\n", __func__);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            float bw = params.vram_bw[i];
+            if (bw <= 0.0f) {
+                auto it = bw_cache.find(devs[i]);
+                if (it == bw_cache.end()) {
+                    bw = common_backend_mem_bw_gbps(devs[i]);
+                    bw_cache.emplace(devs[i], bw);
+                } else {
+                    bw = it->second;
+                }
+            }
+            shares[i] = bw > 0.0f ? bw : 1.0f;
+            COM_INF("  - %s: %.1f GB/s\n", ggml_backend_dev_name(devs[i]), shares[i]);
+        }
+    }
+
+    std::fill(params.tensor_split, params.tensor_split + llama_max_devices(), 0.0f);
+    for (size_t i = 0; i < shares.size() && i < llama_max_devices(); ++i) {
+        params.tensor_split[i] = shares[i];
+    }
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
