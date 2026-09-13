@@ -445,6 +445,12 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+enum common_layer_split_strategy {
+    COMMON_LAYER_SPLIT_STRATEGY_BW,     // distribute layers proportionally to VRAM bandwidth
+    COMMON_LAYER_SPLIT_STRATEGY_EQ,     // distribute layers equally
+    COMMON_LAYER_SPLIT_STRATEGY_MANUAL, // use the proportions given with --tensor-split
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -482,6 +488,8 @@ struct common_params {
     float   moe_pool_pcie_bw = 0.0f;        // PCIe BW (GB/s) for the h* break-even estimate (0 = unset)
     float   moe_pool_ram_bw = 0.0f;         // RAM BW (GB/s) for the h* break-even estimate (0 = unset)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+    common_layer_split_strategy layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_BW; // how to distribute layers across GPUs when tensor_split is not set
+    float   vram_bw[128]       = {0};   // VRAM bandwidth in GB/s per device (0 = measure at startup)
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
@@ -958,6 +966,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+
+// resolve the devices the model would be distributed over (mirrors the default device
+// selection in llama_prepare_model_devices)
+std::vector<ggml_backend_dev_t> common_params_offload_devices(const common_params & params);
+
+// fill params.tensor_split according to params.layer_split_strategy; measures the VRAM
+// bandwidth of each device when needed (strategy bw and no --vram-bw given)
+void common_params_apply_layer_split_strategy(common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

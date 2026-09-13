@@ -2967,8 +2967,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
             }
+
+            // an explicit tensor split selects the manual layer distribution
+            params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_MANUAL;
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
+    add_opt(common_arg(
+        {"--layer-split-strategy"}, "{bw,eq,manual}",
+        "how to distribute model layers across GPUs:\n"
+        "- bw (default): proportionally to the measured VRAM bandwidth of each device\n"
+        "- eq: equally\n"
+        "- manual: use the proportions from --tensor-split",
+        [](common_params & params, const std::string & value) {
+            if (value == "bw") {
+                params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_BW;
+            } else if (value == "eq") {
+                params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_EQ;
+            } else if (value == "manual") {
+                params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_MANUAL;
+            } else {
+                throw std::invalid_argument("invalid value for --layer-split-strategy");
+            }
+        }
+    ).set_env("LLAMA_ARG_LAYER_SPLIT_STRATEGY"));
+    add_opt(common_arg(
+        {"--vram-bw"}, "GB0,GB1,...",
+        "VRAM bandwidth in GB/s per device, comma-separated, a single value is broadcast to all devices;\n"
+        "when set for the bw strategy the startup bandwidth benchmark is skipped (0 = measure)",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            std::fill(params.vram_bw, params.vram_bw + llama_max_devices(), 0.0f);
+            if (split_arg.size() == 1) {
+                const float bw = std::stof(split_arg[0]);
+                std::fill(params.vram_bw, params.vram_bw + llama_max_devices(), bw);
+            } else {
+                for (size_t i = 0; i < split_arg.size(); ++i) {
+                    params.vram_bw[i] = std::stof(split_arg[i]);
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_VRAM_BW"));
     add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
