@@ -665,20 +665,21 @@ void llama_context::init_expert_pools() {
     // layer has both fused gate_up and separate gate/up tensors only the fused one is
     // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
     for (const auto & layer : model.layers) {
-        ggml_tensor * tensors[2];
-        int n_tensors = 0;
+        // the collector is unbounded on purpose: expert-tensor layouts vary by arch
+        // (fused gate_up + down, separate up/gate/down, ...) and future ones may carry
+        // any number of expert tensors per layer
+        std::vector<ggml_tensor *> tensors;
         if (layer.ffn_gate_up_exps != nullptr) {
-            tensors[n_tensors++] = layer.ffn_gate_up_exps;
+            tensors.push_back(layer.ffn_gate_up_exps);
         } else {
-            if (layer.ffn_up_exps   != nullptr) tensors[n_tensors++] = layer.ffn_up_exps;
-            if (layer.ffn_gate_exps != nullptr) tensors[n_tensors++] = layer.ffn_gate_exps;
+            if (layer.ffn_up_exps   != nullptr) tensors.push_back(layer.ffn_up_exps);
+            if (layer.ffn_gate_exps != nullptr) tensors.push_back(layer.ffn_gate_exps);
         }
         if (layer.ffn_down_exps != nullptr) {
-            tensors[n_tensors++] = layer.ffn_down_exps;
+            tensors.push_back(layer.ffn_down_exps);
         }
 
-        for (int i = 0; i < n_tensors; i++) {
-            ggml_tensor * w = tensors[i];
+        for (ggml_tensor * w : tensors) {
             if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
                 continue;
             }
