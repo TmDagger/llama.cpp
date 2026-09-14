@@ -794,6 +794,7 @@ struct ggml_backend_sched_expert_pool {
     int n_pinned = 0;                  // number of pinned slots
     uint64_t stamp = 0;
     uint64_t n_updates = 0;            // pool update calls (for warm unpin decay)
+    uint64_t update_gen = 0;           // compute generation of the last update (dedupe)
 
     // running totals, reported when GGML_MOE_POOL_STATS is set
     uint64_t n_hits = 0;
@@ -870,6 +871,7 @@ struct ggml_backend_sched {
     const ggml_tensor * expert_ids_tensor = nullptr;
     std::vector<int32_t> expert_ids_host;
     std::vector<ggml_bitset_t> expert_ids_used;
+    uint64_t compute_gen = 0; // incremented once per compute_splits() to dedupe pool updates
 
     int debug;
 
@@ -1718,6 +1720,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // the expert ids read-back cache must not survive across computes: the routing tensors
     // keep the same address between runs, but their contents change on every graph execution
     sched->expert_ids_tensor = nullptr;
+    // a pool can be reached from several nodes of the graph (the remap GET_ROWS and the
+    // pooled MUL_MAT_ID); update it at most once per compute
+    sched->compute_gen++;
 
     int prev_backend_id = -1;
 
@@ -1994,6 +1999,12 @@ static void ggml_backend_sched_update_expert_pool(
         const ggml_tensor * ids,
         ggml_backend_t split_backend) {
     GGML_ASSERT(ids != nullptr && "pooled expert ids without a routing tensor");
+
+    // the remap GET_ROWS and the pooled MUL_MAT_ID both reach this pool; update once
+    if (ep.update_gen == sched->compute_gen) {
+        return;
+    }
+    ep.update_gen = sched->compute_gen;
 
     if (ids != sched->expert_ids_tensor) {
         // the ids are produced by a previous split on the compute backend
