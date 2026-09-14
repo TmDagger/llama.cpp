@@ -448,6 +448,7 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 enum common_layer_split_strategy {
     COMMON_LAYER_SPLIT_STRATEGY_BW,     // distribute layers proportionally to VRAM bandwidth
     COMMON_LAYER_SPLIT_STRATEGY_EQ,     // distribute layers equally
+    COMMON_LAYER_SPLIT_STRATEGY_SLOTS,  // equalize the estimated expert cache slots per device
     COMMON_LAYER_SPLIT_STRATEGY_MANUAL, // use the proportions given with --tensor-split
 };
 
@@ -488,7 +489,10 @@ struct common_params {
     float   moe_pool_pcie_bw = 0.0f;        // PCIe BW (GB/s) for the h* break-even estimate (0 = unset)
     float   moe_pool_ram_bw = 0.0f;         // RAM BW (GB/s) for the h* break-even estimate (0 = unset)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
-    common_layer_split_strategy layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_BW; // how to distribute layers across GPUs when tensor_split is not set
+    common_layer_split_strategy layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_BW; // how to distribute layers across GPUs
+    bool    layer_split_strategy_set = false; // true when --layer-split-strategy was given explicitly
+    bool    layer_split_applied      = false; // internal: strategy already resolved for these params
+    bool    split_by_cache_slots     = false; // internal: the model computes the layer split from cache slots
     float   vram_bw[128]       = {0};   // VRAM bandwidth in GB/s per device (0 = measure at startup)
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model

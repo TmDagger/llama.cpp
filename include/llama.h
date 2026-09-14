@@ -329,6 +329,10 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // per-device reserve in MiB kept free when distributing layers by expert cache
+        // slots (split_by_cache_slots), size: llama_max_devices(); may be NULL
+        const int32_t * expert_cache_rail_mb;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.
@@ -347,6 +351,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool split_by_cache_slots; // distribute layers to equalize the expert cache slots per device (ignored when tensor_split is set)
     };
 
     struct llama_sampler_seq_config {

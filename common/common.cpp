@@ -1683,10 +1683,13 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
-// short device-to-device copy benchmark; returns 0 on failure
+// short device-to-device copy benchmark; returns 0 on failure.
+// several rounds are run and the median is taken, the boost state of the device makes a
+// single measurement noisy
 static float common_backend_mem_bw_gbps(ggml_backend_dev_t dev) {
-    const size_t size   = 256ull * 1024 * 1024; // 256 MiB
-    const int    n_iter = 16;
+    const size_t size     = 256ull * 1024 * 1024; // 256 MiB
+    const int    n_iter   = 8;
+    const int    n_rounds = 5;
 
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     if (backend == nullptr) {
@@ -1709,25 +1712,34 @@ static float common_backend_mem_bw_gbps(ggml_backend_dev_t dev) {
         return 0.0f;
     }
 
-    ggml_backend_tensor_copy(a, b); // warmup
-    ggml_backend_synchronize(backend);
-
-    const int64_t t0 = ggml_time_us();
-    for (int i = 0; i < n_iter; ++i) {
+    // warmup
+    for (int i = 0; i < 2*n_iter; ++i) {
         ggml_backend_tensor_copy(a, b);
     }
     ggml_backend_synchronize(backend);
-    const int64_t t1 = ggml_time_us();
 
-    const double seconds = (t1 - t0) / 1e6;
-    const double bytes   = 2.0 * (double) size * n_iter; // read + write
-    const float  gbps    = seconds > 0.0 ? (float) (bytes / seconds / 1e9) : 0.0f;
+    std::vector<float> rounds(n_rounds, 0.0f);
+    for (int r = 0; r < n_rounds; ++r) {
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < n_iter; ++i) {
+            ggml_backend_tensor_copy(a, b);
+        }
+        ggml_backend_synchronize(backend);
+        const int64_t t1 = ggml_time_us();
+
+        const double seconds = (t1 - t0) / 1e6;
+        const double bytes   = 2.0 * (double) size * n_iter; // read + write
+        rounds[r] = seconds > 0.0 ? (float) (bytes / seconds / 1e9) : 0.0f;
+    }
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(backend);
 
-    return gbps;
+    std::sort(rounds.begin(), rounds.end());
+    float gbps = rounds[n_rounds/2];
+    // round to 1 GB/s to keep the split stable across runs
+    return gbps > 0.0f ? std::round(gbps) : 0.0f;
 }
 
 std::vector<ggml_backend_dev_t> common_params_offload_devices(const common_params & params) {
@@ -1787,10 +1799,25 @@ std::vector<ggml_backend_dev_t> common_params_offload_devices(const common_param
 }
 
 void common_params_apply_layer_split_strategy(common_params & params) {
+    if (params.layer_split_applied) {
+        return; // already resolved (the draft model inherits the main split)
+    }
+    params.layer_split_applied = true;
+
     if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
         return;
     }
-    if (params.layer_split_strategy == COMMON_LAYER_SPLIT_STRATEGY_MANUAL) {
+
+    // an explicit --layer-split-strategy wins; otherwise prefer balancing the expert
+    // cache slots when the expert cache is enabled
+    common_layer_split_strategy strategy = params.layer_split_strategy;
+    if (!params.layer_split_strategy_set) {
+        strategy = params.expert_cache_slots > 0 ? COMMON_LAYER_SPLIT_STRATEGY_SLOTS
+                                                 : COMMON_LAYER_SPLIT_STRATEGY_BW;
+    }
+
+    if (strategy == COMMON_LAYER_SPLIT_STRATEGY_MANUAL) {
+        COM_INF("%s: layer split strategy 'manual'\n", __func__);
         return; // --tensor-split already holds the proportions
     }
 
@@ -1799,9 +1826,17 @@ void common_params_apply_layer_split_strategy(common_params & params) {
         return;
     }
 
+    if (strategy == COMMON_LAYER_SPLIT_STRATEGY_SLOTS) {
+        // the model computes the split from the estimated expert cache slots; tensor_split
+        // stays zero so that the model takes the slots branch
+        params.split_by_cache_slots = true;
+        COM_INF("%s: layer split strategy 'slots' over %zu devices\n", __func__, devs.size());
+        return;
+    }
+
     std::vector<float> shares(devs.size(), 1.0f);
 
-    if (params.layer_split_strategy == COMMON_LAYER_SPLIT_STRATEGY_EQ) {
+    if (strategy == COMMON_LAYER_SPLIT_STRATEGY_EQ) {
         COM_INF("%s: layer split strategy 'eq' over %zu devices\n", __func__, devs.size());
     } else {
         // measure the bandwidth once per device per process
@@ -1843,6 +1878,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.expert_cache_rail_mb = params.expert_cache_rail_mb.data();
+    mparams.split_by_cache_slots = params.split_by_cache_slots;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

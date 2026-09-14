@@ -1460,22 +1460,122 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+
     std::vector<float> splits(n_devices());
     if (all_zero) {
-        // default split, by free memory
-        for (size_t i = 0; i < n_devices(); ++i) {
-            ggml_backend_dev_t dev = devices[i].dev;
-            size_t total;
-            size_t free;
-            ggml_backend_dev_memory(dev, &free, &total);
+        bool filled = false;
 
-            // devices can return 0 bytes for free and total memory if they do not
-            // have any to report. in this case, we will use the host memory as a fallback
-            // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
-            if (free == 0 && total == 0) {
-                ggml_backend_dev_memory(cpu_dev, &free, &total);
+        // distribute layers so that the estimated expert cache slots per device are equal
+        if (params.split_by_cache_slots && act_gpu_layers > 0 && hparams.n_expert > 0) {
+            std::vector<size_t> dense_bytes (n_layer_all, 0);
+            std::vector<size_t> expert_bytes(n_layer_all, 0);
+            for (const auto & kv : ml.weights_map) {
+                const std::string & name = kv.first;
+                if (name.rfind("blk.", 0) != 0) {
+                    continue;
+                }
+                const size_t dot = name.find('.', 4);
+                if (dot == std::string::npos) {
+                    continue;
+                }
+                int il = -1;
+                try {
+                    il = std::stoi(name.substr(4, dot - 4));
+                } catch (...) {
+                    continue;
+                }
+                if (il < i_gpu_start || il >= i_gpu_start + act_gpu_layers || il >= n_layer_all) {
+                    continue;
+                }
+                const size_t nb = ggml_nbytes(kv.second.tensor);
+                if (name.find("_exps") != std::string::npos) {
+                    expert_bytes[il] += nb;
+                } else {
+                    dense_bytes[il] += nb;
+                }
             }
-            splits[i] = free;
+
+            size_t dense_sum  = 0;
+            size_t expert_sum = 0;
+            for (int il = i_gpu_start; il < i_gpu_start + act_gpu_layers; ++il) {
+                dense_sum  += dense_bytes[il];
+                expert_sum += expert_bytes[il];
+            }
+
+            if (dense_sum > 0 && expert_sum > 0) {
+                const double dense_avg = (double) dense_sum / act_gpu_layers;
+                // bytes per layer for one slot per expert tensor
+                const double esz_slot  = (double) expert_sum / act_gpu_layers / (double) hparams.n_expert;
+
+                auto split_by_slots = [&](double s) {
+                    for (size_t i = 0; i < n_devices(); ++i) {
+                        size_t total = 0;
+                        size_t free  = 0;
+                        ggml_backend_dev_memory(devices[i].dev, &free, &total);
+                        if (free == 0 && total == 0) {
+                            ggml_backend_dev_memory(cpu_dev, &free, &total);
+                        }
+                        size_t rail = 512ull * 1024 * 1024;
+                        if (params.expert_cache_rail_mb && params.expert_cache_rail_mb[i] > 0) {
+                            rail = (size_t) params.expert_cache_rail_mb[i] * 1024 * 1024;
+                        }
+                        const double avail = (double) free - (double) rail;
+                        splits[i] = avail > 0.0 ? (float) (avail / (dense_avg + esz_slot * s)) : 0.0f;
+                    }
+                };
+
+                const double target = (double) act_gpu_layers;
+
+                // the smallest s with total layer capacity <= target gives the largest
+                // equalized slot level that still fits all offloaded layers
+                double lo = 0.0;
+                double hi = 1.0;
+                split_by_slots(hi);
+                while (std::accumulate(splits.begin(), splits.end(), 0.0) > target && hi < 1e12) {
+                    hi *= 2.0;
+                    split_by_slots(hi);
+                }
+                for (int it = 0; it < 60; ++it) {
+                    const double mid = 0.5*(lo + hi);
+                    split_by_slots(mid);
+                    if (std::accumulate(splits.begin(), splits.end(), 0.0) > target) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                split_by_slots(0.5*(lo + hi));
+
+                const double sum = std::accumulate(splits.begin(), splits.end(), 0.0);
+                if (sum > 0.0) {
+                    filled = true;
+                    LLAMA_LOG_INFO("%s: layer split by cache slots: dense %.1f MiB/layer, expert slot %.1f MiB, target %.2f slots\n",
+                            __func__, dense_avg/1024.0/1024.0, esz_slot/1024.0/1024.0, 0.5*(lo + hi));
+                    for (size_t i = 0; i < n_devices(); ++i) {
+                        LLAMA_LOG_INFO("%s:   %s: %.1f layers\n", __func__, ggml_backend_dev_name(devices[i].dev), splits[i]);
+                    }
+                }
+            }
+        }
+
+        if (!filled) {
+            // default split, by free memory
+            for (size_t i = 0; i < n_devices(); ++i) {
+                ggml_backend_dev_t dev = devices[i].dev;
+                size_t total;
+                size_t free;
+                ggml_backend_dev_memory(dev, &free, &total);
+
+                // devices can return 0 bytes for free and total memory if they do not
+                // have any to report. in this case, we will use the host memory as a fallback
+                // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
+                if (free == 0 && total == 0) {
+                    ggml_backend_dev_memory(cpu_dev, &free, &total);
+                }
+                splits[i] = free;
+            }
         }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
@@ -1491,8 +1591,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
@@ -2767,6 +2865,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.expert_cache_rail_mb        =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -2776,6 +2875,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.split_by_cache_slots        =*/ false,
     };
 
     return result;

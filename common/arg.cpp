@@ -2970,24 +2970,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
             // an explicit tensor split selects the manual layer distribution
             params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_MANUAL;
+            params.layer_split_strategy_set = true;
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
-        {"--layer-split-strategy"}, "{bw,eq,manual}",
+        {"--layer-split-strategy"}, "{bw,eq,slots,manual}",
         "how to distribute model layers across GPUs:\n"
-        "- bw (default): proportionally to the measured VRAM bandwidth of each device\n"
+        "- bw: proportionally to the measured VRAM bandwidth of each device\n"
         "- eq: equally\n"
-        "- manual: use the proportions from --tensor-split",
+        "- slots: equalize the estimated expert cache slots per device (best for MoE decode)\n"
+        "- manual: use the proportions from --tensor-split\n"
+        "(default: 'slots' when --moe-expert-cache > 0, otherwise 'bw')",
         [](common_params & params, const std::string & value) {
             if (value == "bw") {
                 params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_BW;
             } else if (value == "eq") {
                 params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_EQ;
+            } else if (value == "slots") {
+                params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_SLOTS;
             } else if (value == "manual") {
                 params.layer_split_strategy = COMMON_LAYER_SPLIT_STRATEGY_MANUAL;
             } else {
                 throw std::invalid_argument("invalid value for --layer-split-strategy");
             }
+            params.layer_split_strategy_set = true;
         }
     ).set_env("LLAMA_ARG_LAYER_SPLIT_STRATEGY"));
     add_opt(common_arg(
