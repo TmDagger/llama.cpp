@@ -1471,6 +1471,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (params.split_by_cache_slots && act_gpu_layers > 0 && hparams.n_expert > 0) {
             std::vector<size_t> dense_bytes (n_layer_all, 0);
             std::vector<size_t> expert_bytes(n_layer_all, 0);
+            std::string ex_name, de_name;
+            size_t ex_nb = 0, de_nb = 0;
+            int n_ex = 0, n_de = 0;
             for (const auto & kv : ml.weights_map) {
                 const std::string & name = kv.first;
                 if (name.rfind("blk.", 0) != 0) {
@@ -1491,8 +1494,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 const size_t nb = ggml_nbytes(kv.second.tensor);
                 if (name.find("_exps") != std::string::npos) {
+                    if (n_ex++ == 0) { ex_name = name; ex_nb = nb; }
                     expert_bytes[il] += nb;
                 } else {
+                    if (n_de++ == 0) { de_name = name; de_nb = nb; }
                     dense_bytes[il] += nb;
                 }
             }
@@ -1551,6 +1556,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 const double sum = std::accumulate(splits.begin(), splits.end(), 0.0);
                 if (sum > 0.0) {
                     filled = true;
+                    LLAMA_LOG_INFO("%s: cache slots diag: weights_map=%zu n_bytes=%.2f GiB dense_sum=%.2f GiB expert_sum=%.2f GiB dense_avg=%.2f MiB esz_slot=%.2f MiB n_expert=%u act=%d\n",
+                            __func__, ml.weights_map.size(), ml.n_bytes/1024.0/1024.0/1024.0,
+                            dense_sum/1024.0/1024.0/1024.0, expert_sum/1024.0/1024.0/1024.0,
+                            dense_avg/1024.0/1024.0, esz_slot/1024.0/1024.0,
+                            hparams.n_expert, act_gpu_layers);
+                    LLAMA_LOG_INFO("%s: cache slots diag: n_ex=%d e.g. '%s' nb=%.3f MiB | n_de=%d e.g. '%s' nb=%.3f MiB\n",
+                            __func__, n_ex, ex_name.c_str(), ex_nb/1024.0/1024.0, n_de, de_name.c_str(), de_nb/1024.0/1024.0);
                     LLAMA_LOG_INFO("%s: layer split by cache slots: dense %.1f MiB/layer, expert slot %.1f MiB, target %.2f slots\n",
                             __func__, dense_avg/1024.0/1024.0, esz_slot/1024.0/1024.0, 0.5*(lo + hi));
                     for (size_t i = 0; i < n_devices(); ++i) {
