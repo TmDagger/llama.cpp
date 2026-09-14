@@ -39,7 +39,7 @@ struct tensors {
     ggml_tensor * table_gu = nullptr;
     ggml_tensor * table_dn = nullptr;
 
-    ggml_tensor * ids_wide = nullptr; // [n_used, n_tokens_max] I32 device tensor
+    ggml_tensor * ids_wide = nullptr; // [n_expert, n_tokens_max] I32 host tensor
 };
 
 // binds a freshly created tensor to a host buffer and fills it with data
@@ -87,16 +87,14 @@ static ggml_tensor * make_quant_host_tensor(
     return t;
 }
 
-// a device-resident, CONTIGUOUS [n_used, n_tokens_max] I32 tensor holding the expert
-// ids, like the router output of a real model. the ids must live on the accelerator:
-// the pool update reads the routing back from the compute backend in the split
-// prologue, so a host ids tensor behind a scheduler input copy would be read before
-// this ubatch's upload (stale) rather than as-written. the layout must stay dense so
-// that the [n_used, n_tokens] views below are contiguous: the CUDA MXFP4 mmvq
-// mul_mat_id kernel crashes with an illegal memory access on a strided device-side
-// ids tensor (scheduler-copied or host-backed ids never exposed the difference)
-static void make_device_ids(ggml_context * ctx, tensors & ts, ggml_backend_t accel) {
-    const int64_t ne_w[2] = { n_used, n_tokens_max };
+// a device-resident [n_expert, n_tokens_max] I32 tensor whose first n_used rows per
+// column hold the expert ids; strided [n_used, n_tokens] views of it feed the graphs,
+// like the router output of a real model. the ids must live on the accelerator: the
+// pool update reads the routing back from the compute backend in the split prologue,
+// so a host ids tensor behind a scheduler input copy would be read before this
+// ubatch's upload (stale) rather than as-written
+static void make_strided_ids(ggml_context * ctx, tensors & ts, ggml_backend_t accel) {
+    const int64_t ne_w[2] = { n_expert, n_tokens_max };
     ts.ids_wide = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ne_w[0], ne_w[1]);
     ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(
             ggml_backend_get_default_buffer_type(accel), ggml_nbytes(ts.ids_wide));
@@ -106,14 +104,13 @@ static void make_device_ids(ggml_context * ctx, tensors & ts, ggml_backend_t acc
     ggml_backend_buffer_clear(buf, 0);
 }
 
-// refresh the expert ids (the first n_tokens columns; the remaining columns are never
-// read by the graphs but kept deterministic anyway)
+// refresh the expert ids (first n_used rows of each column of the wide store)
 static void set_ids(tensors & ts, int n_tokens,
         const std::vector<int32_t> & ids_data) {
-    std::vector<int32_t> wide((size_t) n_used * n_tokens_max, n_expert - 1);
+    std::vector<int32_t> wide((size_t) n_expert * n_tokens_max, n_expert - 1);
     for (int t = 0; t < n_tokens; t++) {
         for (int e = 0; e < n_used; e++) {
-            wide[t * n_used + e] = ids_data[t * n_used + e];
+            wide[t * n_expert + e] = ids_data[t * n_used + e];
         }
     }
     ggml_backend_tensor_set(ts.ids_wide, wide.data(), 0, ggml_nbytes(ts.ids_wide));
@@ -301,7 +298,7 @@ int main() {
         ts.w_dn = make_quant_host_tensor(tctx, bufts[1], type, ne_w, w_data, "w_dn");
         const int64_t ne_x[2] = { n_in, n_tokens_max };
         ts.x = make_host_tensor(tctx, nullptr, bufts[1], GGML_TYPE_F32, ne_x, 2, x_data, true, "x");
-        make_device_ids(tctx, ts, accel);
+        make_strided_ids(tctx, ts, accel);
 
         ts.pool_gu = ggml_backend_sched_register_expert_pool(sched, ts.w_gu, 0, n_slots, &ts.table_gu);
         ts.pool_dn = ggml_backend_sched_register_expert_pool(sched, ts.w_dn, 0, n_slots, &ts.table_dn);
