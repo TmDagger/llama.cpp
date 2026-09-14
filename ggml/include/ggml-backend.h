@@ -378,6 +378,14 @@ extern "C" {
         int                    n_slots,
         struct ggml_tensor  ** map_table);
 
+    // total expert-pool cache events over the lifetime of the scheduler, summed over all
+    // pools; the same counters behind the GGML_MOE_POOL_STATS log lines. exposed so tests
+    // and tooling can verify the hit-rate telemetry without parsing logs
+    GGML_API void ggml_backend_sched_get_expert_pool_stats(
+        const ggml_backend_sched_t sched,
+        long long * hits,   // may be NULL
+        long long * misses); // may be NULL
+
     //
     // Meta backend
     //

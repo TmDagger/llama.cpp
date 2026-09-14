@@ -797,6 +797,12 @@ struct ggml_backend_sched_expert_pool {
     uint64_t n_misses = 0;
     bool report_stats = false;
     uint64_t n_reports = 0;
+
+    // at most one update per graph execution: the remap GET_ROWS and the pooled
+    // MUL_MAT_ID can both anchor the same pool within one compute, and a second update
+    // would find every used expert already holding a slot from the first and count the
+    // whole ubatch as hits, inflating the hit-rate telemetry
+    bool updated = false;
 };
 
 struct ggml_backend_sched_split {
@@ -1727,6 +1733,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // keep the same address between runs, but their contents change on every graph execution
     sched->expert_ids_tensor = nullptr;
 
+    // same for the per-pool updated flags (see ggml_backend_sched_update_expert_pool)
+    for (auto & ep : sched->expert_pools) {
+        ep.updated = false;
+    }
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1999,6 +2010,15 @@ static void ggml_backend_sched_update_expert_pool(
         ggml_backend_t split_backend) {
     GGML_ASSERT(ids != nullptr && "pooled expert ids without a routing tensor");
 
+    // the remap GET_ROWS and the pooled MUL_MAT_ID can both anchor the same pool within
+    // one compute; skip the redundant call so each used expert is counted exactly once
+    // per ubatch (a second pass would see the slots assigned by the first and record
+    // the whole ubatch as hits)
+    if (ep.updated) {
+        return;
+    }
+    ep.updated = true;
+
     if (ids != sched->expert_ids_tensor) {
         // the ids are produced by a previous split on the compute backend
         const size_t ids_nbytes = ggml_nbytes(ids);
@@ -2197,6 +2217,29 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
             w->name, ggml_backend_name(backend), n_slots, n_expert, pool_size / 1024.0 / 1024.0);
 
     return pool;
+}
+
+void ggml_backend_sched_get_expert_pool_stats(
+        const ggml_backend_sched_t sched,
+        long long * hits,
+        long long * misses) {
+    if (hits != NULL) {
+        *hits = 0;
+    }
+    if (misses != NULL) {
+        *misses = 0;
+    }
+    if (sched == NULL) {
+        return;
+    }
+    for (const auto & ep : sched->expert_pools) {
+        if (hits != NULL) {
+            *hits += (long long) ep.n_hits;
+        }
+        if (misses != NULL) {
+            *misses += (long long) ep.n_misses;
+        }
+    }
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
