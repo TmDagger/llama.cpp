@@ -285,6 +285,11 @@ llama_context::llama_context(
     cparams.expert_cache_slots_down = params.expert_cache_slots_down;
     cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
     cparams.expert_cache_warm = params.expert_cache_warm;
+    cparams.expert_cache_whole_count = params.expert_cache_whole_count;
+    if (params.expert_cache_whole_layers != nullptr) {
+        cparams.expert_cache_whole_layers.assign(params.expert_cache_whole_layers,
+                params.expert_cache_whole_layers + params.n_expert_cache_whole_layers);
+    }
     cparams.expert_cache_rail_mb.assign(llama_max_devices(), 512);
     if (params.expert_cache_rail_mb != nullptr) {
         for (size_t i = 0; i < llama_max_devices(); ++i) {
@@ -607,6 +612,9 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
     expert_pools.clear();
 
     if (cparams.expert_cache_slots <= 0) {
+        if (cparams.expert_cache_whole_count > 0 || !cparams.expert_cache_whole_layers.empty()) {
+            LLAMA_LOG_WARN("%s: --mec-whole ignored: expert cache is disabled (-mec 0)\n", __func__);
+        }
         return;
     }
 
@@ -661,6 +669,15 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
             return cparams.expert_cache_rail_mb[backend_id];
         }
         return cparams.expert_cache_rail_mb.back();
+    };
+
+    // whole-layer pin: keep every expert of these layers resident in VRAM
+    auto is_whole_layer = [&](int il) -> bool {
+        if (il < cparams.expert_cache_whole_count) {
+            return true;
+        }
+        return std::find(cparams.expert_cache_whole_layers.begin(),
+                         cparams.expert_cache_whole_layers.end(), il) != cparams.expert_cache_whole_layers.end();
     };
 
     int n_pooled = 0;
@@ -745,7 +762,8 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
     // waste VRAM.
     struct dev_plan {
         std::vector<ggml_tensor *> w;
-        std::vector<int>           req; // requested slots per tensor
+        std::vector<int>           req;   // requested slots per tensor
+        std::vector<char>          whole; // 1 = pinned whole-layer tensor
     };
     std::vector<dev_plan> plans(backends.size());
 
@@ -763,7 +781,8 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
             continue;
         }
         const int32_t slots_dev = slots_of(backend_id);
-        if (slots_dev <= 0) {
+        const bool whole = is_whole_layer(il);
+        if (slots_dev <= 0 && !whole) {
             continue; // expert cache disabled on this device
         }
 
@@ -785,25 +804,32 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
                 continue;
             }
 
-            // per-tensor slot count: gate/up side uses the gate_up override,
-            // down side uses the down override (0 = fall back to the per-device -mec)
-            const bool is_gate_up = (w == layer.ffn_gate_up_exps || w == layer.ffn_up_exps || w == layer.ffn_gate_exps);
-            const int32_t base_slots = is_gate_up
-                ? (cparams.expert_cache_slots_gate_up > 0 ? cparams.expert_cache_slots_gate_up : slots_dev)
-                : (cparams.expert_cache_slots_down   > 0 ? cparams.expert_cache_slots_down   : slots_dev);
-
             const int n_expert = (int) w->ne[2];
-            if (base_slots >= n_expert) {
-                LLAMA_LOG_WARN("%s: '%s' N=%d clamped to %d (n_expert - 1)\n",
-                        __func__, w->name, base_slots, n_expert - 1);
+            int n_slots = 0;
+            if (whole) {
+                // dedicated slot per expert, no remap and no eviction
+                n_slots = n_expert;
+            } else {
+                // per-tensor slot count: gate/up side uses the gate_up override,
+                // down side uses the down override (0 = fall back to the per-device -mec)
+                const bool is_gate_up = (w == layer.ffn_gate_up_exps || w == layer.ffn_up_exps || w == layer.ffn_gate_exps);
+                const int32_t base_slots = is_gate_up
+                    ? (cparams.expert_cache_slots_gate_up > 0 ? cparams.expert_cache_slots_gate_up : slots_dev)
+                    : (cparams.expert_cache_slots_down   > 0 ? cparams.expert_cache_slots_down   : slots_dev);
+
+                if (base_slots >= n_expert) {
+                    LLAMA_LOG_WARN("%s: '%s' N=%d clamped to %d (n_expert - 1)\n",
+                            __func__, w->name, base_slots, n_expert - 1);
+                }
+                n_slots = std::min<int64_t>((int64_t) base_slots, n_expert - 1);
             }
-            const int n_slots = std::min<int64_t>((int64_t) base_slots, n_expert - 1);
             if (n_slots <= 0) {
                 continue;
             }
 
             plans[backend_id].w.push_back(w);
             plans[backend_id].req.push_back(n_slots);
+            plans[backend_id].whole.push_back(whole ? 1 : 0);
         }
     }
 
@@ -819,9 +845,32 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
         }
         ensure_budget((int) b);
 
+        // whole-layer pins are allocated first at their full size; the remaining tensors
+        // are scaled down to whatever budget is left
+        size_t whole_total = 0;
+        for (size_t i = 0; i < plan.w.size(); ++i) {
+            if (plan.whole[i]) {
+                whole_total += moe_pool_footprint(plan.w[i], plan.req[i]);
+            }
+        }
+        if (whole_total > budget[b]) {
+            LLAMA_LOG_WARN("%s: %s: whole-layer pin does not fit the remaining budget (%.2f > %.2f GiB), disabled on this device\n",
+                    __func__, ggml_backend_dev_name(ggml_backend_get_device(backends[b].get())),
+                    whole_total / 1024.0 / 1024.0 / 1024.0, budget[b] / 1024.0 / 1024.0 / 1024.0);
+            for (size_t i = 0; i < plan.w.size(); ++i) {
+                plan.whole[i] = 0;
+            }
+            whole_total = 0;
+        }
+
+        const size_t budget_nonwhole = budget[b] - whole_total;
+
         auto total_footprint = [&](float scale) -> size_t {
             size_t total = 0;
             for (size_t i = 0; i < plan.w.size(); ++i) {
+                if (plan.whole[i]) {
+                    continue;
+                }
                 const int slots = std::max(1, (int) ((float) plan.req[i] * scale));
                 total += moe_pool_footprint(plan.w[i], slots);
             }
@@ -829,13 +878,13 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
         };
 
         float scale = 1.0f;
-        if (total_footprint(1.0f) > budget[b]) {
+        if (total_footprint(1.0f) > budget_nonwhole) {
             // binary search the largest uniform scale that fits the budget
             float lo = 0.0f;
             float hi = 1.0f;
             for (int it = 0; it < 32; ++it) {
                 const float mid = 0.5f*(lo + hi);
-                if (total_footprint(mid) <= budget[b]) {
+                if (total_footprint(mid) <= budget_nonwhole) {
                     lo = mid;
                 } else {
                     hi = mid;
@@ -844,13 +893,13 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
             scale = lo;
         }
 
-        const size_t total = total_footprint(scale);
-        if (total > budget[b]) {
-            // even one slot per tensor does not fit: leave the device on the host path
+        // when even one slot per non-whole tensor does not fit, leave those on the host path
+        const bool nonwhole_fits = total_footprint(scale) <= budget_nonwhole;
+        if (!nonwhole_fits && whole_total == 0) {
             n_skipped += (int) plan.w.size();
             LLAMA_LOG_WARN("%s: %s: expert cache disabled on this device, the %.2f GiB budget cannot hold one slot of every tensor (%.2f GiB)\n",
                     __func__, ggml_backend_dev_name(ggml_backend_get_device(backends[b].get())),
-                    budget[b] / 1024.0 / 1024.0 / 1024.0, total / 1024.0 / 1024.0 / 1024.0);
+                    budget[b] / 1024.0 / 1024.0 / 1024.0, total_footprint(scale) / 1024.0 / 1024.0 / 1024.0);
             continue;
         }
 
@@ -859,7 +908,12 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
             if (expert_pools.find(w) != expert_pools.end()) {
                 continue; // safety: never register the same tensor twice
             }
-            const int n_slots = std::max(1, (int) ((float) plan.req[i] * scale));
+            const bool whole = plan.whole[i] != 0;
+            if (!whole && !nonwhole_fits) {
+                n_skipped++;
+                continue;
+            }
+            const int n_slots = whole ? plan.req[i] : std::max(1, (int) ((float) plan.req[i] * scale));
 
             budget[b] -= moe_pool_footprint(w, n_slots);
 
@@ -869,11 +923,14 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
                 continue; // allocation failed, keep serving this tensor from host memory
             }
 
-            expert_pools.emplace(w, llama_expert_pool{pool, table});
+            expert_pools.emplace(w, llama_expert_pool{pool, table, n_slots == (int) w->ne[2]});
             n_pooled++;
             n_pooled_dev[b]++;
 
-            if (cparams.expert_cache_warm > 0) {
+            if (whole) {
+                LLAMA_LOG_INFO("%s: '%s' pinned whole layer: %d/%d experts (%.2f MiB)\n",
+                        __func__, w->name, n_slots, (int) w->ne[2], moe_pool_footprint(w, n_slots) / 1024.0 / 1024.0);
+            } else if (cparams.expert_cache_warm > 0) {
                 const int n_pin = ggml_backend_sched_pin_expert_pool(sched.get(), pool,
                         std::min<int>(cparams.expert_cache_warm, n_slots));
                 LLAMA_LOG_DEBUG("%s: '%s' pinned %d warm experts\n", __func__, w->name, n_pin);
@@ -3992,6 +4049,9 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache_slots_down     =*/ 0,
         /*.expert_cache_slots_gate_up  =*/ 0,
         /*.expert_cache_warm           =*/ 0,
+        /*.expert_cache_whole_count    =*/ 0,
+        /*.expert_cache_whole_layers   =*/ nullptr,
+        /*.n_expert_cache_whole_layers =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
@@ -4296,6 +4356,44 @@ void llama_get_expert_pool_stats(const struct llama_context * ctx, struct llama_
         stats->hits[i]   = g.hits[i];
         stats->misses[i] = g.misses[i];
     }
+}
+
+int llama_get_expert_pool_records(
+        const struct llama_context * ctx,
+        int64_t now_us,
+        struct llama_expert_pool_record * records,
+        int max_records) {
+    if (!ctx || !records || max_records <= 0) {
+        return 0;
+    }
+
+    std::vector<struct ggml_backend_sched_expert_pool_record> tmp(max_records);
+    const int n = ggml_backend_sched_get_expert_pool_records(ctx->get_sched(), now_us, tmp.data(), max_records);
+
+    for (int i = 0; i < n; ++i) {
+        const auto & g = tmp[i];
+        auto       & r = records[i];
+        memset(&r, 0, sizeof(r));
+        snprintf(r.name, sizeof(r.name), "%s", g.name);
+        r.layer          = g.layer;
+        r.backend_id     = g.backend_id;
+        r.n_expert       = g.n_expert;
+        r.n_slots        = g.n_slots;
+        r.n_free         = g.n_free;
+        r.fully_resident = g.fully_resident;
+        r.n_hits         = g.n_hits;
+        r.n_misses       = g.n_misses;
+        r.n_evict        = g.n_evict;
+        r.n_fallback     = g.n_fallback;
+        r.bytes_copied   = g.bytes_copied;
+        r.us_update      = g.us_update;
+        r.step           = g.step;
+        for (int w = 0; w < LLAMA_EXPERT_POOL_MAX_WINDOWS; ++w) {
+            r.n_loaded[w]   = g.n_loaded[w];
+            r.n_resident[w] = g.n_resident[w];
+        }
+    }
+    return n;
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

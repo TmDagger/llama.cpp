@@ -379,6 +379,9 @@ extern "C" {
         int32_t  expert_cache_slots_down;    // slots per down-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]
         int32_t  expert_cache_slots_gate_up; // slots per gate/up-expert tensor (0 = use expert_cache_slots) [EXPERIMENTAL]
         int32_t  expert_cache_warm; // pin first N experts of each pool at init (0 = off) [EXPERIMENTAL]
+        int32_t  expert_cache_whole_count; // keep all experts of the first N layers resident (0 = off) [EXPERIMENTAL]
+        const int32_t * expert_cache_whole_layers; // explicit layers to keep fully resident; null = none [EXPERIMENTAL]
+        int32_t  n_expert_cache_whole_layers; // number of entries in expert_cache_whole_layers [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -608,6 +611,36 @@ extern "C" {
     };
 
     LLAMA_API void llama_get_expert_pool_stats(const struct llama_context * ctx, struct llama_expert_pool_stats * stats);
+
+    // Per-pool expert cache telemetry (debug). Residency window order:
+    // 0 = last 1 s, 1 = last 10 s, 2 = last 60 s, 3 = last decode step.
+    #define LLAMA_EXPERT_POOL_MAX_WINDOWS 4
+    struct llama_expert_pool_record {
+        char     name[128];
+        int      layer;
+        int      backend_id;
+        int      n_expert;
+        int      n_slots;
+        int      n_free;
+        int      fully_resident;
+        uint64_t n_hits;
+        uint64_t n_misses;
+        uint64_t n_evict;
+        uint64_t n_fallback;
+        uint64_t bytes_copied;
+        uint64_t us_update;
+        uint64_t step;
+        uint64_t n_loaded  [LLAMA_EXPERT_POOL_MAX_WINDOWS];
+        uint64_t n_resident[LLAMA_EXPERT_POOL_MAX_WINDOWS];
+    };
+
+    // Fill up to max_records per-pool records; returns the number written.
+    // now_us <= 0 lets the implementation pick the current time.
+    LLAMA_API int llama_get_expert_pool_records(
+        const struct llama_context * ctx,
+        int64_t now_us,
+        struct llama_expert_pool_record * records,
+        int max_records);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);

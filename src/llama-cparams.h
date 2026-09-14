@@ -34,6 +34,9 @@ struct llama_cparams {
     int32_t  expert_cache_slots_gate_up = 0;
     // pin first N experts of each pool at init (0 = off)
     int32_t  expert_cache_warm = 0;
+    // keep all experts of the first N layers resident (0 = off) and/or an explicit layer list
+    int32_t  expert_cache_whole_count = 0;
+    std::vector<int32_t> expert_cache_whole_layers;
 
     float rope_freq_base;
     float rope_freq_scale;

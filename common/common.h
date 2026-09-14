@@ -486,6 +486,8 @@ struct common_params {
     int32_t expert_cache_slots_down = 0;    // slots per down-expert tensor (0 = use expert_cache_slots)
     int32_t expert_cache_slots_gate_up = 0; // slots per gate/up-expert tensor (0 = use expert_cache_slots)
     int32_t expert_cache_warm = 0;          // pin first N experts of each pool at init (0 = off)
+    int32_t expert_cache_whole_count = 0;   // keep all experts of the first N layers resident (0 = off)
+    std::vector<int32_t> expert_cache_whole_layers; // explicit layers to keep fully resident
     float   moe_pool_pcie_bw = 0.0f;        // PCIe BW (GB/s) for the h* break-even estimate (0 = unset)
     float   moe_pool_ram_bw = 0.0f;         // RAM BW (GB/s) for the h* break-even estimate (0 = unset)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs

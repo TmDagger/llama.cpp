@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -33,6 +34,7 @@
 #include <numeric>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <thread> // for hardware_concurrency
@@ -2874,6 +2876,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_cache_warm = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WARM"));
+    add_opt(common_arg(
+        {"--mec-whole", "--moe-expert-cache-whole"}, "N | N0,N1,... | A-B,...",
+        "keep all experts of the given layers resident in VRAM (whole-layer pin)\n"
+        "a single number keeps the first N layers; otherwise a comma list of indices and\n"
+        "inclusive ranges, e.g. 0,1,5 or 0-2,5 (requires --moe-expert-cache, 0 = off)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_whole_layers.clear();
+            params.expert_cache_whole_count = 0;
+
+            const bool single_int = !value.empty() &&
+                std::all_of(value.begin(), value.end(), [](char c) { return std::isdigit((unsigned char) c) != 0; });
+            if (single_int) {
+                params.expert_cache_whole_count = std::stoi(value);
+                return;
+            }
+
+            std::set<int32_t> layers;
+            std::stringstream ss(value);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (tok.empty()) {
+                    continue;
+                }
+                const size_t dash = tok.find('-');
+                if (dash == std::string::npos) {
+                    const int32_t v = std::stoi(tok);
+                    if (v < 0) {
+                        throw std::invalid_argument("invalid layer");
+                    }
+                    layers.insert(v);
+                } else {
+                    const int32_t a = std::stoi(tok.substr(0, dash));
+                    const int32_t b = std::stoi(tok.substr(dash + 1));
+                    if (a < 0 || b < a) {
+                        throw std::invalid_argument("invalid layer range");
+                    }
+                    for (int32_t i = a; i <= b; ++i) {
+                        layers.insert(i);
+                    }
+                }
+            }
+            params.expert_cache_whole_layers.assign(layers.begin(), layers.end());
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WHOLE"));
     add_opt(common_arg(
         {"--moe-pool-pcie-bw"}, "GB/S",
         "PCIe bandwidth in GB/s for the h* = 1 - PCIe/RAM break-even estimate (0 = unset)",

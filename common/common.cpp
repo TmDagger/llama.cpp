@@ -1943,6 +1943,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_slots_down = params.expert_cache_slots_down;
     cparams.expert_cache_slots_gate_up = params.expert_cache_slots_gate_up;
     cparams.expert_cache_warm = params.expert_cache_warm;
+    cparams.expert_cache_whole_count = params.expert_cache_whole_count;
+    cparams.expert_cache_whole_layers = params.expert_cache_whole_layers.empty() ? nullptr : params.expert_cache_whole_layers.data();
+    cparams.n_expert_cache_whole_layers = (int32_t) params.expert_cache_whole_layers.size();
     cparams.expert_cache_rail_mb = params.expert_cache_rail_mb.empty() ? nullptr : params.expert_cache_rail_mb.data();
     cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 

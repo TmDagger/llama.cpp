@@ -404,6 +404,40 @@ extern "C" {
         ggml_backend_sched_t sched,
         struct ggml_backend_sched_expert_pool_stats * stats);
 
+    // Per-pool telemetry (debug). One record per registered expert pool.
+    // The residency windows are time-based (1 s, 10 s, 60 s) and step-based (last decode step).
+    #define GGML_SCHED_EXPERT_POOL_MAX_WINDOWS 4
+    struct ggml_backend_sched_expert_pool_record {
+        char     name[128];
+        int      layer;          // parsed from "blk.<N>." (-1 if unknown)
+        int      backend_id;
+        int      n_expert;
+        int      n_slots;
+        int      n_free;
+        int      fully_resident; // 1 = pool holds every expert (dedicated slots)
+        uint64_t n_hits;
+        uint64_t n_misses;
+        uint64_t n_evict;
+        uint64_t n_fallback;     // ubatches routed around this pool
+        uint64_t bytes_copied;
+        uint64_t us_update;      // time spent issuing pool updates
+        uint64_t step;           // pool updates (decode steps) seen
+        uint64_t n_loaded  [GGML_SCHED_EXPERT_POOL_MAX_WINDOWS];
+        uint64_t n_resident[GGML_SCHED_EXPERT_POOL_MAX_WINDOWS];
+    };
+
+    // Fill up to max_records records; returns the number written. now_us <= 0 uses ggml_time_us().
+    GGML_API int ggml_backend_sched_get_expert_pool_records(
+        ggml_backend_sched_t sched,
+        int64_t now_us,
+        struct ggml_backend_sched_expert_pool_record * records,
+        int max_records);
+
+    // Note that a graph routed around the pool (e.g. a ubatch wider than the pool).
+    GGML_API void ggml_backend_sched_expert_pool_note_fallback(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * pool);
+
     //
     // Meta backend
     //

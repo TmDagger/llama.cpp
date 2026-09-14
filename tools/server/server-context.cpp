@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <deque>
 #include <exception>
+#include <map>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -236,12 +238,249 @@ struct server_batch {
     }
 };
 
+// Per-layer MoE expert cache telemetry (debug). Enabled by GGML_MOE_POOL_STATS and
+// GGML_MOE_POOL_STATS_LAYERS. Sampled once per generated token; windowed hit rates are
+// derived from the cumulative per-layer counters, survival from the pool load timestamps.
+namespace {
+
+struct moe_telem_state {
+    bool    checked = false;
+    bool    enabled = false;
+    int64_t t_out   = 0;
+    std::map<int, std::deque<std::pair<int64_t, std::pair<uint64_t, uint64_t>>>> hist; // layer -> (t_us, (hits, misses))
+};
+
+static moe_telem_state g_moe_telem;
+
+static std::string moe_pct(uint64_t hits, uint64_t miss) {
+    const uint64_t t = hits + miss;
+    if (t == 0) {
+        return "n/a";
+    }
+    return string_format("%.1f%%", 100.0*(double)hits/(double)t);
+}
+
+static void moe_telem_sample(llama_context * ctx) {
+    if (!g_moe_telem.checked) {
+        g_moe_telem.checked = true;
+        g_moe_telem.enabled = getenv("GGML_MOE_POOL_STATS") != nullptr &&
+                              getenv("GGML_MOE_POOL_STATS_LAYERS") != nullptr;
+    }
+    if (!g_moe_telem.enabled || ctx == nullptr) {
+        return;
+    }
+
+    std::vector<llama_expert_pool_record> recs(256);
+    int n = llama_get_expert_pool_records(ctx, 0, recs.data(), (int) recs.size());
+    if (n == (int) recs.size()) {
+        recs.resize(recs.size()*2);
+        n = llama_get_expert_pool_records(ctx, 0, recs.data(), (int) recs.size());
+    }
+
+    const int64_t now = ggml_time_us();
+    std::map<int, std::pair<uint64_t, uint64_t>> hm;
+    for (int i = 0; i < n; ++i) {
+        const int layer = recs[i].layer;
+        if (layer < 0) {
+            continue;
+        }
+        auto & p = hm[layer];
+        p.first  += recs[i].n_hits;
+        p.second += recs[i].n_misses;
+    }
+    for (const auto & kv : hm) {
+        auto & dq = g_moe_telem.hist[kv.first];
+        dq.emplace_back(now, kv.second);
+        while (!dq.empty() && now - dq.front().first > 60*1000*1000) {
+            dq.pop_front();
+        }
+    }
+}
+
+static std::vector<std::string> moe_telem_format(llama_context * ctx, int64_t now) {
+    std::vector<std::string> out;
+    if (!g_moe_telem.enabled || ctx == nullptr) {
+        return out;
+    }
+
+    struct agg {
+        uint64_t hits = 0, miss = 0, ev = 0, fb = 0, bytes = 0, us = 0;
+        uint64_t load[4] = {0};
+        uint64_t res [4] = {0};
+        int n_expert = 0, n_slots = 0;
+    };
+
+    std::vector<llama_expert_pool_record> recs(256);
+    int n = llama_get_expert_pool_records(ctx, now, recs.data(), (int) recs.size());
+    if (n == (int) recs.size()) {
+        recs.resize(recs.size()*2);
+        n = llama_get_expert_pool_records(ctx, now, recs.data(), (int) recs.size());
+    }
+
+    std::map<int, agg> cur;
+    for (int i = 0; i < n; ++i) {
+        if (recs[i].layer < 0) {
+            continue;
+        }
+        auto & a = cur[recs[i].layer];
+        a.hits  += recs[i].n_hits;
+        a.miss  += recs[i].n_misses;
+        a.ev    += recs[i].n_evict;
+        a.fb    += recs[i].n_fallback;
+        a.bytes += recs[i].bytes_copied;
+        a.us    += recs[i].us_update;
+        a.n_expert = recs[i].n_expert;
+        a.n_slots  = recs[i].n_slots;
+        for (int w = 0; w < 4; ++w) {
+            a.load[w] += recs[i].n_loaded[w];
+            a.res [w] += recs[i].n_resident[w];
+        }
+    }
+
+    auto win_pct = [&](const std::deque<std::pair<int64_t, std::pair<uint64_t, uint64_t>>> & dq, int64_t win_us) -> std::string {
+        if (dq.size() < 2) {
+            return "n/a";
+        }
+        const auto & last = dq.back();
+        size_t i = dq.size() - 1;
+        while (i > 0 && (now - dq[i - 1].first) <= win_us) {
+            --i;
+        }
+        if (i == 0) {
+            return "n/a";
+        }
+        const auto & base = dq[i - 1];
+        return moe_pct(last.second.first - base.second.first, last.second.second - base.second.second);
+    };
+
+    auto load_pct = [](const agg & a, int w) -> std::string {
+        if (a.load[w] == 0) {
+            return "n/a";
+        }
+        return string_format("%.0f%%", 100.0*(double)a.res[w]/(double)a.load[w]);
+    };
+
+    for (const auto & kv : cur) {
+        const int layer = kv.first;
+        const agg & a = kv.second;
+
+        auto it = g_moe_telem.hist.find(layer);
+        if (it == g_moe_telem.hist.end() || it->second.size() < 2) {
+            continue;
+        }
+        const auto & dq = it->second;
+
+        const std::string w1  = win_pct(dq, 1*1000*1000);
+        const std::string w10 = win_pct(dq, 10*1000*1000);
+        const std::string w60 = win_pct(dq, 60*1000*1000);
+
+        // windows shorter than the output period: list the per-token / per-second values
+        // accumulated since the last output; longer windows report the latest value only
+        size_t from = 0;
+        while (from < dq.size() && dq[from].first < g_moe_telem.t_out) {
+            ++from;
+        }
+        if (from > 0) {
+            --from;
+        }
+
+        std::string list_tok;
+        {
+            size_t printed = 0;
+            for (size_t i = from + 1; i < dq.size(); ++i) {
+                const std::string s = moe_pct(dq[i].second.first - dq[i-1].second.first,
+                                              dq[i].second.second - dq[i-1].second.second);
+                if (!list_tok.empty()) {
+                    list_tok += ",";
+                }
+                list_tok += s;
+                if (++printed >= 8) {
+                    list_tok += ",...";
+                    break;
+                }
+            }
+        }
+        if (list_tok.empty()) {
+            list_tok = w1;
+        }
+
+        std::string list_sec;
+        {
+            size_t i = from + 1;
+            int buckets = 0;
+            while (i < dq.size() && buckets < 4) {
+                const int64_t t_end = dq[i-1].first + 1000*1000;
+                size_t j = i;
+                while (j < dq.size() && dq[j].first < t_end) {
+                    ++j;
+                }
+                if (j == i) {
+                    break;
+                }
+                const std::string s = moe_pct(dq[j-1].second.first - dq[i-1].second.first,
+                                              dq[j-1].second.second - dq[i-1].second.second);
+                if (!list_sec.empty()) {
+                    list_sec += ",";
+                }
+                list_sec += s;
+                ++buckets;
+                i = j;
+            }
+        }
+        if (list_sec.empty()) {
+            list_sec = w1;
+        }
+
+        out.push_back(string_format(
+                "moe L%02d hit 1tok[%s] 1s[%s] 10s=%s 60s=%s | surv 1s=%s 10s=%s 60s=%s | miss=%llu fb=%llu ev=%llu copy=%lluMiB upd=%.1fms",
+                layer, list_tok.c_str(), list_sec.c_str(), w10.c_str(), w60.c_str(),
+                load_pct(a, 0).c_str(), load_pct(a, 1).c_str(), load_pct(a, 2).c_str(),
+                (unsigned long long) a.miss, (unsigned long long) a.fb, (unsigned long long) a.ev,
+                (unsigned long long) (a.bytes / 1024 / 1024), (double) a.us / 1000.0));
+    }
+
+    // recommendation: layers whose cache barely beats the random baseline (n_slots/n_expert)
+    // gain little from LRU, so pinning them fully is a candidate for --mec-whole
+    std::string reco;
+    {
+        std::vector<int> cand;
+        for (const auto & kv : cur) {
+            const agg & a = kv.second;
+            if (a.n_expert <= 0 || a.n_slots <= 0 || a.miss == 0 || a.n_slots == a.n_expert) {
+                continue;
+            }
+            const double hit = 100.0*(double)a.hits/(double)(a.hits + a.miss);
+            const double base = 100.0*(double)a.n_slots/(double)a.n_expert;
+            if (hit < 1.5*base) {
+                cand.push_back(kv.first);
+            }
+        }
+        if (!cand.empty()) {
+            std::string list;
+            for (int l : cand) {
+                if (!list.empty()) {
+                    list += ",";
+                }
+                list += std::to_string(l);
+            }
+            reco = string_format("moe recommend: layers with a cache near the random baseline -> --mec-whole %s", list.c_str());
+        }
+    }
+    if (!reco.empty()) {
+        out.push_back(reco);
+    }
+
+    g_moe_telem.t_out = now;
+    return out;
+}
+
+} // namespace
+
 struct server_slot {
     int id;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
-
     common_memory mem;
 
     // multimodal
@@ -596,6 +835,8 @@ struct server_slot {
     }
 
     void print_timings_tg() {
+        moe_telem_sample(ctx_tgt);
+
         if (stats.n_gen < 100) {
             return;
         }
@@ -645,6 +886,12 @@ struct server_slot {
             if (dh + dm > 0) {
                 SLT_INF(*this, "moe expert pool: hit %.1f%% (%llu hits / %llu misses) in window%s\n",
                         100.0*(double)dh/(double)(dh + dm), (unsigned long long) dh, (unsigned long long) dm, dev.c_str());
+            }
+        }
+
+        if (ctx_tgt != nullptr) {
+            for (const std::string & line : moe_telem_format(ctx_tgt, t_now)) {
+                SLT_INF(*this, "%s\n", line.c_str());
             }
         }
     }

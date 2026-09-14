@@ -785,6 +785,10 @@ struct ggml_backend_sched_expert_pool {
     int n_slots;
     size_t expert_size;      // == w->nb[2]
 
+    int layer = -1;          // parsed from "blk.<N>." for telemetry
+    int backend_id = -1;
+    bool fully_resident = false; // n_slots == n_expert: dedicated slots, no remap/eviction
+
     // slot bookkeeping (host side)
     std::vector<int32_t>  expert_slot; // [n_expert], -1 = not cached
     std::vector<int32_t>  slot_expert; // [n_slots], -1 = free
@@ -796,9 +800,18 @@ struct ggml_backend_sched_expert_pool {
     uint64_t n_updates = 0;            // pool update calls (for warm unpin decay)
     uint64_t update_gen = 0;           // compute generation of the last update (dedupe)
 
+    // telemetry
+    std::vector<int64_t>  expert_load_us;   // [n_expert] last load time (0 = never)
+    std::vector<uint64_t> expert_load_step; // [n_expert] step of last load
+    uint64_t step = 0;                      // pool updates seen
+
     // running totals, reported when GGML_MOE_POOL_STATS is set
     uint64_t n_hits = 0;
     uint64_t n_misses = 0;
+    uint64_t n_evict = 0;
+    uint64_t n_fallback = 0;
+    uint64_t bytes_copied = 0;
+    uint64_t us_update = 0;
     bool report_stats = false;
     uint64_t n_reports = 0;
 };
@@ -1780,8 +1793,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 auto it = sched->expert_pool_by_buf.find(src0->buffer);
                 if (it != sched->expert_pool_by_buf.end()) {
-                    ggml_backend_sched_update_expert_pool(sched, sched->expert_pools[it->second],
-                        ggml_backend_sched_expert_pool_unwrap_ids(node->src[2]), split_backend);
+                    auto & ep = sched->expert_pools[it->second];
+                    const struct ggml_tensor * ids_pooled = node->src[2];
+                    // fully resident pools use the original expert ids directly
+                    while (ids_pooled != NULL && (ids_pooled->op == GGML_OP_RESHAPE || ids_pooled->op == GGML_OP_CONT)) {
+                        ids_pooled = ids_pooled->src[0];
+                    }
+                    ggml_backend_sched_update_expert_pool(sched, ep,
+                        ep.fully_resident ? ids_pooled : ggml_backend_sched_expert_pool_unwrap_ids(node->src[2]), split_backend);
                 }
             }
         }
@@ -2032,6 +2051,9 @@ static void ggml_backend_sched_update_expert_pool(
 
     int32_t * table = (int32_t *) ep.table->data;
 
+    const int64_t t_start = ggml_time_us();
+    ep.step++;
+
     // stamps assigned during this update, used to guarantee that eviction never picks a slot
     // that was loaded or refreshed by the current ubatch
     const uint64_t stamp_base = ep.stamp;
@@ -2046,14 +2068,19 @@ static void ggml_backend_sched_update_expert_pool(
             // cache hit - refresh the LRU stamp
             ep.n_hits++;
             ep.slot_stamp[slot] = ++ep.stamp;
-            table[e] = slot;
+            if (!ep.fully_resident) {
+                table[e] = slot;
+            }
             continue;
         }
         ep.n_misses++;
 
-        // cache miss - prefer a free slot, otherwise evict the least recently used one
-        // (pinned warm slots are never evicted while protection holds)
-        if (ep.n_free > 0) {
+        if (ep.fully_resident) {
+            // dedicated slot: expert e always lives in slot e, no eviction and no remap
+            slot = e;
+            ep.n_free--;
+        } else if (ep.n_free > 0) {
+            // cache miss - prefer a free slot
             for (int s = 0; s < ep.n_slots; s++) {
                 if (ep.slot_expert[s] < 0) {
                     slot = s;
@@ -2062,6 +2089,8 @@ static void ggml_backend_sched_update_expert_pool(
                 }
             }
         } else {
+            // otherwise evict the least recently used slot
+            // (pinned warm slots are never evicted while protection holds)
             slot = -1;
             for (int s = 0; s < ep.n_slots; s++) {
                 if (ep.slot_pinned[s]) {
@@ -2085,12 +2114,19 @@ static void ggml_backend_sched_update_expert_pool(
             // if this fires, a graph with more experts than slots was routed through the pool
             GGML_ASSERT(ep.slot_stamp[slot] <= stamp_base && "expert pool overflow: the ubatch uses more distinct experts than there are slots");
             ep.expert_slot[ep.slot_expert[slot]] = -1;
+            ep.n_evict++;
         }
 
         ep.slot_expert[slot] = e;
         ep.expert_slot[e]    = slot;
         ep.slot_stamp[slot]  = ++ep.stamp;
-        table[e] = slot;
+        if (!ep.fully_resident) {
+            table[e] = slot;
+        }
+
+        ep.expert_load_us[e]   = t_start;
+        ep.expert_load_step[e] = ep.step;
+        ep.bytes_copied       += ep.expert_size;
 
         // copy the expert from the host weights into its slot
         ggml_backend_tensor_set_async(split_backend, ep.pool,
@@ -2100,6 +2136,7 @@ static void ggml_backend_sched_update_expert_pool(
     }
 
     ep.n_updates++;
+    ep.us_update += (uint64_t) (ggml_time_us() - t_start);
 
     // optional decay of warm protection: LLAMA_MOE_POOL_UNPIN_AFTER=N lifts the
     // pin after N pool updates (0 = keep pinned for the process lifetime)
@@ -2133,7 +2170,7 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     GGML_ASSERT(w->op == GGML_OP_NONE);
     GGML_ASSERT(w->buffer != NULL && ggml_backend_buffer_is_host(w->buffer));
     GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
-    GGML_ASSERT(n_slots > 0 && n_slots < w->ne[2]);
+    GGML_ASSERT(n_slots > 0 && n_slots <= w->ne[2]);
 
     for (const auto & ep : sched->expert_pools) {
         GGML_ASSERT(ep.w != w && "expert pool already registered for this tensor");
@@ -2207,15 +2244,35 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.n_expert  = n_expert;
     ep.n_slots   = n_slots;
     ep.expert_size = esz;
+    ep.backend_id = backend_id;
+    ep.fully_resident = (n_slots == n_expert);
+    ep.layer = -1;
+    if (strncmp(w->name, "blk.", 4) == 0) {
+        char * end = nullptr;
+        const long l = strtol(w->name + 4, &end, 10);
+        if (end != nullptr && *end == '.') {
+            ep.layer = (int) l;
+        }
+    }
     ep.expert_slot.assign(n_expert, -1);
     ep.slot_expert.assign(n_slots, -1);
     ep.slot_stamp.assign(n_slots, 0);
     ep.slot_pinned.assign(n_slots, 0);
+    ep.expert_load_us.assign(n_expert, 0);
+    ep.expert_load_step.assign(n_expert, 0);
     ep.n_free  = n_slots;
     ep.n_pinned = 0;
     ep.stamp   = 0;
     ep.n_updates = 0;
     ep.report_stats = getenv("GGML_MOE_POOL_STATS") != NULL;
+
+    // fully resident pools use dedicated slots (slot == expert id), so seed an identity map
+    if (ep.fully_resident) {
+        int32_t * t = (int32_t *) table->data;
+        for (int e = 0; e < n_expert; ++e) {
+            t[e] = e;
+        }
+    }
 
     sched->expert_pools.push_back(std::move(ep));
     sched->expert_pool_by_buf[pool_buf] = (int) sched->expert_pools.size() - 1;
@@ -2317,6 +2374,80 @@ void ggml_backend_sched_get_expert_pool_stats(
             }
         }
     }
+}
+
+void ggml_backend_sched_expert_pool_note_fallback(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor  * pool) {
+    if (sched == NULL || pool == NULL) {
+        return;
+    }
+    for (auto & ep : sched->expert_pools) {
+        if (ep.pool == pool) {
+            ep.n_fallback++;
+            return;
+        }
+    }
+}
+
+int ggml_backend_sched_get_expert_pool_records(
+        ggml_backend_sched_t sched,
+        int64_t now_us,
+        struct ggml_backend_sched_expert_pool_record * records,
+        int max_records) {
+    if (sched == NULL || records == NULL || max_records <= 0) {
+        return 0;
+    }
+    if (now_us <= 0) {
+        now_us = ggml_time_us();
+    }
+    static const int64_t win_us[3] = { 1000*1000, 10*1000*1000, 60*1000*1000 };
+
+    int n = 0;
+    for (const auto & ep : sched->expert_pools) {
+        if (n >= max_records) {
+            break;
+        }
+        struct ggml_backend_sched_expert_pool_record & r = records[n];
+        memset(&r, 0, sizeof(r));
+        snprintf(r.name, sizeof(r.name), "%s", ep.w->name);
+        r.layer          = ep.layer;
+        r.backend_id     = ep.backend_id;
+        r.n_expert       = ep.n_expert;
+        r.n_slots        = ep.n_slots;
+        r.n_free         = ep.n_free;
+        r.fully_resident = ep.fully_resident ? 1 : 0;
+        r.n_hits         = ep.n_hits;
+        r.n_misses       = ep.n_misses;
+        r.n_evict        = ep.n_evict;
+        r.n_fallback     = ep.n_fallback;
+        r.bytes_copied   = ep.bytes_copied;
+        r.us_update      = ep.us_update;
+        r.step           = ep.step;
+
+        for (int w = 0; w < 3; ++w) {
+            for (int e = 0; e < ep.n_expert; ++e) {
+                const int64_t t = ep.expert_load_us[e];
+                if (t == 0 || now_us - t > win_us[w]) {
+                    continue;
+                }
+                r.n_loaded[w]++;
+                if (ep.expert_slot[e] >= 0) {
+                    r.n_resident[w]++;
+                }
+            }
+        }
+        for (int e = 0; e < ep.n_expert; ++e) {
+            if (ep.expert_load_step[e] != 0 && ep.expert_load_step[e] == ep.step) {
+                r.n_loaded[3]++;
+                if (ep.expert_slot[e] >= 0) {
+                    r.n_resident[3]++;
+                }
+            }
+        }
+        n++;
+    }
+    return n;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
