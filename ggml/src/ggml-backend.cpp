@@ -1771,7 +1771,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // where the remap and the MUL_MAT_ID share one split)
                 if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL) {
                     for (auto & ep : sched->expert_pools) {
-                        if (tensor_copy(ep.table, split->backend_id, sched->cur_copy) == node->src[0]) {
+                        // the remap reads either the table's device copy (remap scheduled
+                        // on the compute backend) or the raw host table (remap scheduled
+                        // on a backend that reads host memory directly, no copy made)
+                        if (tensor_copy(ep.table, split->backend_id, sched->cur_copy) == node->src[0] || node->src[0] == ep.table) {
                             const struct ggml_tensor * ids = node->src[1];
                             while (ids != NULL && ids->op == GGML_OP_RESHAPE) {
                                 ids = ids->src[0];
