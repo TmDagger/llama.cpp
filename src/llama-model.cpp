@@ -1504,15 +1504,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             size_t dense_sum  = 0;
             size_t expert_sum = 0;
-            for (int il = i_gpu_start; il < i_gpu_start + act_gpu_layers; ++il) {
+            // act_gpu_layers may count the output layer, which has no blk.* weights, so
+            // clamp to the repeating layers that dense_bytes/expert_bytes cover
+            const int i_gpu_end = std::min(i_gpu_start + act_gpu_layers, n_layer_all);
+            const int n_gpu_rep = i_gpu_end - i_gpu_start;
+            for (int il = i_gpu_start; il < i_gpu_end; ++il) {
                 dense_sum  += dense_bytes[il];
                 expert_sum += expert_bytes[il];
             }
 
-            if (dense_sum > 0 && expert_sum > 0) {
-                const double dense_avg = (double) dense_sum / act_gpu_layers;
+            if (n_gpu_rep > 0 && dense_sum > 0 && expert_sum > 0) {
+                const double dense_avg = (double) dense_sum / n_gpu_rep;
                 // bytes per layer for one slot per expert tensor
-                const double esz_slot  = (double) expert_sum / act_gpu_layers / (double) hparams.n_expert;
+                const double esz_slot  = (double) expert_sum / n_gpu_rep / (double) hparams.n_expert;
 
                 auto split_by_slots = [&](double s) {
                     for (size_t i = 0; i < n_devices(); ++i) {
