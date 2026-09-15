@@ -295,7 +295,7 @@ llama_context::llama_context(
                 params.expert_cache_per_layer + params.n_expert_cache_per_layer);
     }
     cparams.expert_cache_external_reserve = (size_t) std::max<int64_t>(0, params.expert_cache_external_reserve);
-    cparams.expert_cache_rail_mb.assign(llama_max_devices(), 512);
+    cparams.expert_cache_rail_mb.assign(llama_max_devices(), 768);
     if (params.expert_cache_rail_mb != nullptr) {
         for (size_t i = 0; i < llama_max_devices(); ++i) {
             cparams.expert_cache_rail_mb[i] = params.expert_cache_rail_mb[i];
@@ -667,7 +667,7 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
     // per-device VRAM rail in MiB: cparams holds an array of llama_max_devices()
     // values; a single CLI value was already broadcast across devices
     auto rail_mb_of = [&](int backend_id) -> int32_t {
-        static const int32_t def = 512;
+        static const int32_t def = 768;
         if (cparams.expert_cache_rail_mb.empty()) {
             return def;
         }
@@ -1025,6 +1025,20 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
             if (n_pooled_dev[i] > 0) {
                 LLAMA_LOG_INFO("%s:   %s: %d pooled tensors, %.2f GiB budget remaining\n",
                         __func__, ggml_backend_name(backends[i].get()), n_pooled_dev[i], budget[i] / 1024.0 / 1024.0 / 1024.0);
+
+                // estimate the free VRAM once the compute buffers are allocated; too little
+                // headroom makes the driver page to host memory and stall
+                ggml_backend_dev_t dev = ggml_backend_get_device(backends[i].get());
+                size_t free_now = 0;
+                size_t total_now = 0;
+                ggml_backend_dev_memory(dev, &free_now, &total_now);
+                const size_t compute_i = i < compute_reserve.size() ? compute_reserve[i] : 0;
+                const size_t post_compute = free_now > compute_i ? free_now - compute_i : 0;
+                if (post_compute < 384ull*1024*1024) {
+                    LLAMA_LOG_WARN("%s: only ~%.0f MiB VRAM would stay free on %s after the compute buffers; "
+                            "if this device spills to host memory, raise --moe-expert-cache-rail-mb for it\n",
+                            __func__, post_compute/1024.0/1024.0, ggml_backend_dev_name(dev));
+                }
             }
         }
         // decode ubatches wider than the pool fall back to the host-copy path per

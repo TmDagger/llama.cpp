@@ -64,7 +64,7 @@ layers and dropping the rest to the slow host-copy path. `llama-server`/`llama-c
 the effective per-device budget and the applied scale. Only if even one slot per tensor
 does not fit is the device left entirely on the host path. A fully pooled device is
 reported by the `pooled N offloaded MoE expert weight tensors ...` summary line.
-The rail defaults to 512 MiB and is configurable per device. The slot count `-mec`
+The rail defaults to 768 MiB and is configurable per device. The slot count `-mec`
 takes the same per-device list form (device order), so a card with more free memory can
 keep a larger hot set:
 

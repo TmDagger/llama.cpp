@@ -491,6 +491,7 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
     std::map<int, double> hit_sig;   // sigma
     std::map<int, int>    cur_slots;
     std::map<int, int>    n_expert;
+    std::map<int, int>    expert_used;
     std::map<int, int>    dev_of;
 
     double miss_sum = 0.0;
@@ -513,6 +514,7 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
         upd_ps[layer]    = (double) l.us / (double) l.steps / 1000.0;
         cur_slots[layer] = l.prev.n_slots;
         n_expert[layer]  = l.prev.n_expert;
+        expert_used[layer] = l.prev.n_expert_used;
         dev_of[layer]    = l.prev.backend_id;
         miss_sum += miss_ps[layer];
         n_layers++;
@@ -542,33 +544,56 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 kv.first, copy_ps_dev, upd_ps_dev));
     }
 
-    // --mec-per-layer: scale each layer's slots by its miss rate, then fit the current
-    // total (equalizing the hit/miss rate also evens out copy and upd)
+    // --mec-per-layer: scale each layer's slots by its miss rate, fitting the current
+    // total of every device separately (equalizing the hit/miss rate also evens out copy
+    // and upd; the clamps keep the suggestion inside the model's expert range)
     const double mean_miss = miss_sum / n_layers;
     if (mean_miss > 0.0) {
         std::vector<int> sug(max_layer + 1, -1);
-        long sum_cur = 0;
-        long sum_sug = 0;
-        int first_layer = -1;
+
+        std::map<int, std::vector<int>> by_dev;
         for (int layer = 0; layer <= max_layer; ++layer) {
-            auto it = miss_ps.find(layer);
-            if (it == miss_ps.end()) {
+            if (miss_ps.find(layer) == miss_ps.end()) {
                 continue;
             }
-            const int ne = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
-            int val = (int) std::lround((double) cur_slots[layer] * it->second / mean_miss);
-            val = std::max(1, std::min(val, ne));
-            sug[layer] = val;
-            sum_cur += cur_slots[layer];
-            sum_sug += val;
-            if (first_layer < 0) {
-                first_layer = layer;
+            by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
+        }
+
+        for (const auto & kv : by_dev) {
+            const std::vector<int> & ls = kv.second;
+            if (ls.empty()) {
+                continue;
             }
+
+            long   sum_cur = 0;
+            double sum_raw = 0.0;
+            std::vector<double> raw(ls.size(), 0.0);
+            for (size_t i = 0; i < ls.size(); ++i) {
+                const int layer = ls[i];
+                raw[i] = (double) cur_slots[layer] * miss_ps[layer] / mean_miss;
+                sum_cur += cur_slots[layer];
+                sum_raw += raw[i];
+            }
+
+            const double scale = sum_raw > 0.0 ? (double) sum_cur / sum_raw : 1.0;
+            long sum_sug = 0;
+            for (size_t i = 0; i < ls.size(); ++i) {
+                const int layer = ls[i];
+                const int ne   = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+                const int nmin = std::max(1, expert_used[layer]);
+                int val = (int) std::lround(raw[i] * scale);
+                val = std::max(nmin, std::min(val, ne));
+                sug[layer] = val;
+                sum_sug += val;
+            }
+
+            // keep the device's total unchanged: hand the residual to its first layer
+            const int layer = ls[0];
+            const int ne    = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+            const int nmin  = std::max(1, expert_used[layer]);
+            sug[layer] = std::max(nmin, std::min((int) (sug[layer] + (sum_cur - sum_sug)), ne));
         }
-        if (first_layer >= 0 && sum_sug != sum_cur) {
-            const int ne = n_expert[first_layer] > 0 ? n_expert[first_layer] : cur_slots[first_layer];
-            sug[first_layer] = std::max(1, std::min((int) (sug[first_layer] + (sum_cur - sum_sug)), ne));
-        }
+
         std::string list;
         for (int layer = 0; layer <= max_layer; ++layer) {
             if (!list.empty()) {
@@ -636,7 +661,7 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 }
                 list += string_format("%.3f", w[i].second / wsum);
             }
-            out.push_back(string_format("moe recommend: --ts %s (%s)",
+            out.push_back(string_format("moe recommend: --ts %s (%s; optimize --mec-per-layer first, then re-measure on a clean run; move towards the target in steps, watching for PCIe saturation or cache distortion)",
                     list.c_str(), mode == 0 ? "equalize copy, assumes similar PCIe bw" : "equalize upd per step per device"));
         }
     }
