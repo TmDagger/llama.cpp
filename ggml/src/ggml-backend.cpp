@@ -1757,20 +1757,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // update the expert pools read by this split: missing experts are copied into the
-        // pool and the map table is rewritten, before the table is uploaded by the input
-        // copy below and the split is launched
+        // update the expert pools read by this split: missing experts are copied into
+        // the pool, the map table is rewritten and uploaded by the update itself, all
+        // before the split is launched
         if (!sched->expert_pools.empty()) {
             for (int j = 0; j < split->graph.n_nodes; j++) {
                 struct ggml_tensor * node = split->graph.nodes[j];
-                // the remap GET_ROWS over a pool map table consumes the table uploaded by
-                // THIS split's input copies, so the pool must be updated before that upload;
-                // updating only at the pooled MUL_MAT_ID below is too late: with host-side
-                // weights the remap lands in its own earlier split and would map this
-                // ubatch's ids onto the PREVIOUS ubatch's slots. note: in the split graph
-                // the GET_ROWS reads the table's device copy, so match the copy, not the
-                // registered buffer (the MMID branch below also covers single-split cases
-                // where the remap and the MUL_MAT_ID share one split)
+                // the remap GET_ROWS consumes the pool-owned device map table, so the
+                // pool must be updated before this split runs; updating only at the
+                // pooled MUL_MAT_ID below is too late: with host-side weights the remap
+                // lands in its own earlier split and would map this ubatch's ids onto
+                // the PREVIOUS ubatch's slots. the device table's pointer is stable, so
+                // the anchor is a direct match against it (a remap that reaches compute
+                // without such a match means the table was not scheduled correctly -
+                // see the abort below)
                 if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL) {
                     bool anchor_hit = false;
                     for (auto & ep : sched->expert_pools) {
@@ -2225,12 +2225,12 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     memset(table->data, 0, n_expert * sizeof(int32_t));
 
     ggml_backend_sched_expert_pool ep;
-    ep.w            = w;
-    ep.pool         = pool;
-    ep.table        = table;
-    ep.table_dev    = table_dev;
-    ep.pool_buf     = pool_buf;
-    ep.table_buf    = table_buf;
+    ep.w             = w;
+    ep.pool          = pool;
+    ep.table         = table;
+    ep.table_dev     = table_dev;
+    ep.pool_buf      = pool_buf;
+    ep.table_buf     = table_buf;
     ep.table_dev_buf = table_dev_buf;
     ep.backend   = backend;
     ep.n_expert  = n_expert;

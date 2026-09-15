@@ -7,9 +7,9 @@
 // (and on Ada/Blackwell it applies to every quant type), so nt <= 8 covers the MMVQ path
 // at its full batch and nt = 9 is what actually reaches the MMQ ids path (Blackwell: the
 // native FP4 kernels) - the path a real prefill takes.
-// the expert id backing store lives on the accelerator, like the router output of a real
-// model; the reference and pooled MUL_MAT_ID run in the same graph and must match
-// bit-exact.
+// the expert ids live in a host tensor whose strided views feed the graphs (so the
+// scheduler has to copy them like a router output crossing backends); the reference and
+// pooled MUL_MAT_ID run in the same graph and must match bit-exact.
 //
 // needs an accelerator backend (Metal/CUDA/...); exits with success when there is none
 
