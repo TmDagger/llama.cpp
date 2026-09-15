@@ -776,9 +776,11 @@ static bool ggml_is_view_op(enum ggml_op op) {
 struct ggml_backend_sched_expert_pool {
     ggml_tensor * w;         // original weight tensor in a host buffer (ne[2] == n_expert)
     ggml_tensor * pool;      // pool tensor on the compute backend (ne[2] == n_slots)
-    ggml_tensor * table;     // I32 map tensor in a host buffer (ne[0] == n_expert), INPUT flag
+    ggml_tensor * table;     // I32 map tensor in a host buffer (ne[0] == n_expert), rewritten by the update
+    ggml_tensor * table_dev; // device copy of the map table the remap GET_ROWS reads
     ggml_backend_buffer_t pool_buf;
     ggml_backend_buffer_t table_buf;
+    ggml_backend_buffer_t table_dev_buf;
     ggml_backend_t backend;  // backend hosting the pool
 
     int n_expert;
@@ -1772,7 +1774,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL) {
                     bool anchor_hit = false;
                     for (auto & ep : sched->expert_pools) {
-                        if (tensor_copy(ep.table, split->backend_id, sched->cur_copy) == node->src[0]) {
+                        // the device map table is pool-owned, so its pointer is stable and
+                        // needs no scheduler copy matching
+                        if (ep.table_dev == node->src[0]) {
                             anchor_hit = true;
                             const struct ggml_tensor * ids = node->src[1];
                             while (ids != NULL && ids->op == GGML_OP_RESHAPE) {
@@ -2034,15 +2038,18 @@ static void ggml_backend_sched_update_expert_pool(
     }
     ep.updated = true;
 
+    // the table upload below overwrites the device map table that the previous ubatch's
+    // remap GET_ROWS and pooled MUL_MAT_ID may still be reading (the pool owns a single
+    // table copy, not the double-buffered scheduler input copies), and the read-back of
+    // the ids must wait for the router that produced them: synchronize once here
+    ggml_backend_synchronize(split_backend);
+
     if (ids != sched->expert_ids_tensor) {
         // the ids are produced by a previous split on the compute backend
         const size_t ids_nbytes = ggml_nbytes(ids);
         sched->expert_ids_host.resize(ids_nbytes / sizeof(int32_t));
         // note: the sync get is intentional - the async variants of some backends (e.g. Metal)
-        // require page-aligned host buffers for zero-copy reads, which a std::vector is not;
-        // the synchronize also guarantees that any reads of the pool by previously launched
-        // splits have completed before we overwrite slots below
-        ggml_backend_synchronize(split_backend);
+        // require page-aligned host buffers for zero-copy reads, which a std::vector is not
         ggml_backend_tensor_get(ids, sched->expert_ids_host.data(), 0, ids_nbytes);
         sched->expert_ids_tensor = ids;
     }
@@ -2113,6 +2120,12 @@ static void ggml_backend_sched_update_expert_pool(
             ep.expert_size);
     }
 
+    // upload the rewritten table to the device copy that the remap GET_ROWS reads; the
+    // copy is enqueued on the split stream, so it is ordered before the remap kernel.
+    // the table is pool-owned (not a scheduler split input), which keeps the update ->
+    // upload -> remap order under the pool's own control
+    ggml_backend_tensor_set_async(split_backend, ep.table_dev, ep.table->data, 0, ggml_nbytes(ep.table));
+
     if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
         ep.n_reports++;
         GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses), %d of %d slots free\n",
@@ -2153,17 +2166,27 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     }
     ggml_backend_buffer_set_usage(pool_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // the map table is a graph input in a host buffer, uploaded by the split input copy path
+    // the host-side map table: the update rewrites it before every ubatch
     ggml_backend_buffer_t table_buf = ggml_backend_alloc_buffer(sched->backends[sched->n_backends - 1], n_expert * sizeof(int32_t));
     if (table_buf == NULL) {
         ggml_backend_buffer_free(pool_buf);
         GGML_LOG_ERROR("%s: failed to allocate the map table for '%s'\n", __func__, w->name);
         return NULL;
     }
+    // the device copy the remap GET_ROWS reads: owned by the pool (not a scheduler
+    // split-input copy), so its pointer is stable and its upload is done by the update
+    // itself instead of depending on the split input copy path
+    ggml_backend_buffer_t table_dev_buf = ggml_backend_alloc_buffer(backend, n_expert * sizeof(int32_t));
+    if (table_dev_buf == NULL) {
+        ggml_backend_buffer_free(table_buf);
+        ggml_backend_buffer_free(pool_buf);
+        GGML_LOG_ERROR("%s: failed to allocate the device map table for '%s'\n", __func__, w->name);
+        return NULL;
+    }
 
     // pool and map tensors must outlive sched->ctx, which is recreated on every graph split
     if (sched->ctx_pools == NULL) {
-        // sized for up to ~2000 pools (two tensors each), enough for any model
+        // sized for up to ~1300 pools (three tensors each), enough for any model
         struct ggml_init_params iparams = {
             /*.mem_size   =*/ 4096 * ggml_tensor_overhead(),
             /*.mem_buffer =*/ NULL,
@@ -2175,12 +2198,13 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
 
     const int64_t ne[3] = { w->ne[0], w->ne[1], n_slots };
     ggml_tensor * pool  = ggml_new_tensor(sched->ctx_pools, w->type, 3, ne);
-    // 2D [1, n_expert] (not 1D): the graph's ids -> slot remap GET_ROWS reads the table
-    // directly; a 1D table would need a RESHAPE view in the graph, and views carry no
-    // buffer, so the pooled-split boundary check (which keys on src buffers) could not
-    // see it and the remap would be scheduled into the split BEFORE the pool update
-    ggml_tensor * table = ggml_new_tensor_2d(sched->ctx_pools, GGML_TYPE_I32, 1, n_expert);
-    GGML_ASSERT(pool != NULL && table != NULL);
+    // 2D [1, n_expert] (not 1D): the graph's ids -> slot remap GET_ROWS reads the device
+    // table directly; a 1D table would need a RESHAPE view in the graph, and views carry
+    // no buffer, so the pooled-split boundary check (which keys on src buffers) could
+    // not see it and the remap would be scheduled into the split BEFORE the pool update
+    ggml_tensor * table     = ggml_new_tensor_2d(sched->ctx_pools, GGML_TYPE_I32, 1, n_expert);
+    ggml_tensor * table_dev = ggml_new_tensor_2d(sched->ctx_pools, GGML_TYPE_I32, 1, n_expert);
+    GGML_ASSERT(pool != NULL && table != NULL && table_dev != NULL);
 
     pool->data   = ggml_backend_buffer_get_base(pool_buf);
     pool->buffer = pool_buf;
@@ -2188,20 +2212,26 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
 
     table->data   = ggml_backend_buffer_get_base(table_buf);
     table->buffer = table_buf;
-    ggml_set_input(table);
     ggml_format_name(table, "%s (expert map)", w->name);
+
+    table_dev->data   = ggml_backend_buffer_get_base(table_dev_buf);
+    table_dev->buffer = table_dev_buf;
+    ggml_format_name(table_dev, "%s (expert map)", w->name);
 
     // initialize the pool contents to zero so that the defensive tail never contains NaNs
     // note: individual experts are always fully overwritten before use
     ggml_backend_buffer_clear(pool_buf, 0);
+    ggml_backend_buffer_clear(table_dev_buf, 0);
     memset(table->data, 0, n_expert * sizeof(int32_t));
 
     ggml_backend_sched_expert_pool ep;
-    ep.w         = w;
-    ep.pool      = pool;
-    ep.table     = table;
-    ep.pool_buf  = pool_buf;
-    ep.table_buf = table_buf;
+    ep.w            = w;
+    ep.pool         = pool;
+    ep.table        = table;
+    ep.table_dev    = table_dev;
+    ep.pool_buf     = pool_buf;
+    ep.table_buf    = table_buf;
+    ep.table_dev_buf = table_dev_buf;
     ep.backend   = backend;
     ep.n_expert  = n_expert;
     ep.n_slots   = n_slots;
@@ -2215,17 +2245,16 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
 
     sched->expert_pools.push_back(std::move(ep));
     sched->expert_pool_by_buf[pool_buf] = (int) sched->expert_pools.size() - 1;
-    // the ids -> slot remap (GET_ROWS over the map table) must be computed in the SAME
-    // split as the pooled MUL_MAT_ID, so registering the table buffer too makes the
-    // remap start its own split: the pool update (table rewrite + slot copies) then runs
-    // in that split's prologue, BEFORE the split input copy uploads the fresh table. if
-    // the remap instead landed in an earlier split, it would consume the table uploaded
-    // for the PREVIOUS ubatch, and every cache miss would read whatever expert last
-    // occupied the (now remapped) slot
-    sched->expert_pool_by_buf[table_buf] = (int) sched->expert_pools.size() - 1;
+    // the ids -> slot remap (GET_ROWS over the device map table) must run after the pool
+    // update, so registering the device table buffer makes the remap start its own split:
+    // the update (table rewrite + slot copies + table upload) then runs in that split's
+    // prologue, before the split is launched. if the remap instead landed in an earlier
+    // split, it would consume the table of the PREVIOUS ubatch, and every cache miss
+    // would read whatever expert last occupied the (now remapped) slot
+    sched->expert_pool_by_buf[table_dev_buf] = (int) sched->expert_pools.size() - 1;
 
     if (map_table != NULL) {
-        *map_table = table;
+        *map_table = table_dev;
     }
 
     GGML_LOG_INFO("%s: expert pool for '%s' on %s: %d/%d experts (%.2f MiB)\n", __func__,
@@ -2338,6 +2367,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (auto & ep : sched->expert_pools) {
         ggml_backend_buffer_free(ep.pool_buf);
         ggml_backend_buffer_free(ep.table_buf);
+        ggml_backend_buffer_free(ep.table_dev_buf);
     }
     if (sched->ctx_pools != NULL) {
         ggml_free(sched->ctx_pools);
