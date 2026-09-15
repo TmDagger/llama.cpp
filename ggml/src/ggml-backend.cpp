@@ -1770,8 +1770,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // registered buffer (the MMID branch below also covers single-split cases
                 // where the remap and the MUL_MAT_ID share one split)
                 if (node->op == GGML_OP_GET_ROWS && node->src[0] != NULL) {
+                    bool anchor_hit = false;
                     for (auto & ep : sched->expert_pools) {
                         if (tensor_copy(ep.table, split->backend_id, sched->cur_copy) == node->src[0]) {
+                            anchor_hit = true;
                             const struct ggml_tensor * ids = node->src[1];
                             while (ids != NULL && ids->op == GGML_OP_RESHAPE) {
                                 ids = ids->src[0];
@@ -1782,6 +1784,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_sched_update_expert_pool(sched, ep, ids, split_backend);
                             break;
                         }
+                    }
+                    // a remap GET_ROWS over a pool map table that reaches compute without
+                    // its input copy having been scheduled means the pool update was
+                    // skipped (e.g. a stale scheduler copy from a split_graph re-entry):
+                    // the remap would silently route onto stale slots, so fail loudly
+                    if (!anchor_hit && strstr(node->src[0]->name, "(expert map)") != NULL) {
+                        GGML_ABORT("expert pool: remap GET_ROWS over '%s' without a scheduled table copy (split %d on %s)",
+                                node->src[0]->name, split_id, ggml_backend_name(split_backend));
                     }
                     continue;
                 }
@@ -2009,6 +2019,11 @@ static void ggml_backend_sched_update_expert_pool(
         const ggml_tensor * ids,
         ggml_backend_t split_backend) {
     GGML_ASSERT(ids != nullptr && "pooled expert ids without a routing tensor");
+
+    // a routing tensor without a backing buffer is a scheduler copy whose registration
+    // was reset (e.g. a graph recomputed after a sched_reset): it never receives data,
+    // and reading it here would poison the map table with garbage routing
+    GGML_ASSERT(ids->buffer != NULL && "expert pool: routing tensor without a buffer (stale scheduler copy?)");
 
     // the remap GET_ROWS and the pooled MUL_MAT_ID can both anchor the same pool within
     // one compute; skip the redundant call so each used expert is counted exactly once
