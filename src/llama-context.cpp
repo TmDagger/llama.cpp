@@ -4455,6 +4455,7 @@ int llama_get_expert_pool_records(
         r.backend_id      = g.backend_id;
         r.n_expert        = g.n_expert;
         r.n_slots         = g.n_slots;
+        r.n_expert_used   = g.layer >= 0 ? (int) ctx->get_model().hparams.n_expert_used(g.layer) : 0;
         r.n_free          = g.n_free;
         r.fully_resident  = g.fully_resident;
         r.n_hits          = g.n_hits;

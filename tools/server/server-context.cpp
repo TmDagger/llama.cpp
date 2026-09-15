@@ -239,49 +239,71 @@ struct server_batch {
     }
 };
 
-// Per-layer MoE expert cache telemetry (debug). Enabled by GGML_MOE_POOL_STATS and
-// GGML_MOE_POOL_STATS_LAYERS. A snapshot is taken once per generated step; the metrics
-// below are computed over the samples since the last output.
+// Per-layer MoE expert cache telemetry (debug). Enabled by GGML_MOE_POOL_STATS; the
+// detailed per-step lines additionally need GGML_MOE_POOL_STATS_LAYERS. The state lives
+// in the slot so that the accumulators cover exactly one generation.
 namespace {
 
 struct moe_telem_snap {
-    uint64_t hits = 0;
-    uint64_t miss = 0;
-    uint64_t ev   = 0;
-    uint64_t fb   = 0;
+    uint64_t hits = 0;   // representative expert tensor, cumulative
+    uint64_t miss = 0;   // representative expert tensor, cumulative
+    uint64_t ev = 0;
+    uint64_t fb = 0;
     uint64_t bytes = 0;
-    uint64_t us   = 0;
+    uint64_t us = 0;
     uint64_t step = 0;
     uint64_t sum_life = 0;
-    int      n_expert = 0;
-    int      n_slots  = 0;
+    int n_expert = 0;
+    int n_slots = 0;
+    int n_expert_used = 0;
+    int backend_id = -1;
+};
+
+struct moe_telem_layer {
+    moe_telem_snap prev;
+    bool has_prev = false;
+
+    // per-generation accumulators
+    double   sum_hit  = 0.0;
+    double   sum_hit2 = 0.0;
+    uint64_t n_hit    = 0;
+    uint64_t miss     = 0;
+    uint64_t bytes    = 0;
+    uint64_t us       = 0;
+    uint64_t steps    = 0;
+
+    // periodic output history
+    std::deque<std::pair<int64_t, moe_telem_snap>> hist;
+};
+
+struct moe_telem_dev {
+    uint64_t bytes = 0;
+    uint64_t us    = 0;
+    uint64_t steps = 0;
 };
 
 struct moe_telem_state {
     bool    checked = false;
-    bool    enabled = false;
+    bool    enabled = false; // GGML_MOE_POOL_STATS
+    bool    layers  = false; // GGML_MOE_POOL_STATS_LAYERS
     bool    legend  = false;
     int64_t t_out   = 0;
-    std::map<int, std::deque<std::pair<int64_t, moe_telem_snap>>> hist; // layer -> (t_us, snap)
+    std::map<int, moe_telem_layer> layers_map;
+    std::map<int, moe_telem_dev>   dev;
 };
 
-static moe_telem_state g_moe_telem;
-
-static std::string moe_pct(uint64_t hits, uint64_t miss) {
-    const uint64_t t = hits + miss;
-    if (t == 0) {
-        return "n/a";
+static void moe_telem_check(moe_telem_state & st) {
+    if (st.checked) {
+        return;
     }
-    return string_format("%.1f%%", 100.0*(double)hits/(double)t);
+    st.checked = true;
+    st.enabled = getenv("GGML_MOE_POOL_STATS") != nullptr;
+    st.layers  = getenv("GGML_MOE_POOL_STATS_LAYERS") != nullptr;
 }
 
-static void moe_telem_sample(llama_context * ctx) {
-    if (!g_moe_telem.checked) {
-        g_moe_telem.checked = true;
-        g_moe_telem.enabled = getenv("GGML_MOE_POOL_STATS") != nullptr &&
-                              getenv("GGML_MOE_POOL_STATS_LAYERS") != nullptr;
-    }
-    if (!g_moe_telem.enabled || ctx == nullptr) {
+static void moe_telem_sample(llama_context * ctx, moe_telem_state & st) {
+    moe_telem_check(st);
+    if (!st.enabled || ctx == nullptr) {
         return;
     }
 
@@ -293,60 +315,101 @@ static void moe_telem_sample(llama_context * ctx) {
         n = llama_get_expert_pool_records(ctx, recs.data(), (int) recs.size());
     }
 
+    // aggregate per layer: hits/miss come from the first (representative) tensor of the
+    // layer, the remaining counters are summed over the layer's tensors
     std::map<int, moe_telem_snap> cur;
     for (int i = 0; i < n; ++i) {
         const int layer = recs[i].layer;
         if (layer < 0) {
             continue;
         }
-        auto & s = cur[layer];
-        s.hits     += recs[i].n_hits;
-        s.miss     += recs[i].n_misses;
+        auto it = cur.find(layer);
+        if (it == cur.end()) {
+            auto & s = cur[layer];
+            s.hits          = recs[i].n_hits;
+            s.miss          = recs[i].n_misses;
+            s.n_expert      = recs[i].n_expert;
+            s.n_slots       = recs[i].n_slots;
+            s.n_expert_used = recs[i].n_expert_used;
+            s.backend_id    = recs[i].backend_id;
+            s.step          = recs[i].step;
+            it = cur.find(layer);
+        }
+        auto & s = it->second;
         s.ev       += recs[i].n_evict;
         s.fb       += recs[i].n_fallback;
         s.bytes    += recs[i].bytes_copied;
         s.us       += recs[i].us_update;
         s.sum_life += recs[i].sum_lifetime_us;
         s.step      = std::max<uint64_t>(s.step, recs[i].step);
-        s.n_expert  = recs[i].n_expert;
-        s.n_slots   = recs[i].n_slots;
     }
 
     const int64_t now = ggml_time_us();
     for (const auto & kv : cur) {
-        auto & dq = g_moe_telem.hist[kv.first];
-        dq.emplace_back(now, kv.second);
-        while (!dq.empty() && now - dq.front().first > 60*1000*1000) {
-            dq.pop_front();
+        moe_telem_layer & l = st.layers_map[kv.first];
+        const moe_telem_snap & c = kv.second;
+        if (l.has_prev) {
+            const moe_telem_snap & p = l.prev;
+            const uint64_t dh = c.hits - p.hits;
+            const uint64_t dm = c.miss - p.miss;
+            const uint64_t dt = c.step > p.step ? c.step - p.step : 1;
+            const double h = (dh + dm) ? 100.0*(double)dh/(double)(dh + dm) : 100.0;
+            const uint64_t db = c.bytes - p.bytes;
+            const uint64_t du = c.us - p.us;
+
+            l.sum_hit  += h;
+            l.sum_hit2 += h*h;
+            l.n_hit++;
+            l.miss  += dm;
+            l.bytes += db;
+            l.us    += du;
+            l.steps += dt;
+
+            if (c.backend_id >= 0) {
+                moe_telem_dev & d = st.dev[c.backend_id];
+                d.bytes += db;
+                d.us    += du;
+                d.steps  = std::max(d.steps, l.steps);
+            }
+        }
+        l.prev     = c;
+        l.has_prev = true;
+
+        if (st.layers) {
+            l.hist.emplace_back(now, c);
+            while (!l.hist.empty() && now - l.hist.front().first > 60*1000*1000) {
+                l.hist.pop_front();
+            }
         }
     }
 }
 
-static std::vector<std::string> moe_telem_format(llama_context * ctx) {
+static std::vector<std::string> moe_telem_format(llama_context * ctx, moe_telem_state & st) {
     std::vector<std::string> out;
-    if (!g_moe_telem.enabled || ctx == nullptr) {
+    if (!st.enabled || !st.layers || ctx == nullptr) {
         return out;
     }
 
-    if (!g_moe_telem.legend) {
-        g_moe_telem.legend = true;
-        out.push_back("moe telemetry: hit=mean+-sigma per step; m1tok=[misses per step histogram]; "
+    if (!st.legend) {
+        st.legend = true;
+        out.push_back("moe telemetry: hit=mean+-sigma per step; m1tok=[experts missed per step]; "
                       "life=avg expert lifetime before eviction; ev=evictions; fb=fallback ubatches; "
                       "copy=bytes copied per step; upd=pool update time per step");
     }
 
     const int64_t now = ggml_time_us();
 
-    for (const auto & kv : g_moe_telem.hist) {
+    for (auto & kv : st.layers_map) {
         const int layer = kv.first;
-        const auto & dq = kv.second;
+        moe_telem_layer & l = kv.second;
+        const auto & dq = l.hist;
         if (dq.size() < 2) {
             continue;
         }
 
         // baseline: last sample at or before the last output
         size_t b = 0;
-        while (b + 1 < dq.size() && dq[b + 1].first <= g_moe_telem.t_out) {
+        while (b + 1 < dq.size() && dq[b + 1].first <= st.t_out) {
             ++b;
         }
 
@@ -354,11 +417,12 @@ static std::vector<std::string> moe_telem_format(llama_context * ctx) {
         const auto & last  = dq.back().second;
         const uint64_t dsteps = last.step > first.step ? last.step - first.step : 0;
 
-        // per-step hit rate and miss histogram since the last output
-        double sum = 0.0, sum2 = 0.0;
-        int    ns  = 0;
-        uint64_t hist_bucket[17] = {0};
-        int    hist_max = 0;
+        const int kmax = last.n_expert_used > 0 ? last.n_expert_used : 16;
+
+        double   sum  = 0.0;
+        double   sum2 = 0.0;
+        int      ns   = 0;
+        std::vector<uint64_t> hist_bucket(kmax + 1, 0);
         for (size_t i = b + 1; i < dq.size(); ++i) {
             const auto & p = dq[i-1].second;
             const auto & c = dq[i].second;
@@ -370,9 +434,8 @@ static std::vector<std::string> moe_telem_format(llama_context * ctx) {
             sum2 += h*h;
             ++ns;
             const uint64_t per_step_miss = (dm + dt - 1) / dt;
-            const int bucket = per_step_miss < 16 ? (int) per_step_miss : 16;
+            const uint64_t bucket = std::min<uint64_t>(per_step_miss, (uint64_t) kmax);
             hist_bucket[bucket]++;
-            hist_max = std::max(hist_max, bucket);
         }
 
         std::string hit_str = "n/a";
@@ -383,15 +446,11 @@ static std::vector<std::string> moe_telem_format(llama_context * ctx) {
         }
 
         std::string hist_str;
-        if (ns > 0) {
-            for (int m = 0; m <= hist_max; ++m) {
-                if (!hist_str.empty()) {
-                    hist_str += ",";
-                }
-                hist_str += string_format("%dm=%.0f%%", m, 100.0*(double)hist_bucket[m]/ns);
+        for (int m = 0; m <= kmax; ++m) {
+            if (!hist_str.empty()) {
+                hist_str += ",";
             }
-        } else {
-            hist_str = "n/a";
+            hist_str += string_format("%dm=%.0f%%", m, ns ? 100.0*(double)hist_bucket[m]/ns : 0.0);
         }
 
         const uint64_t d_ev   = last.ev  - first.ev;
@@ -414,37 +473,174 @@ static std::vector<std::string> moe_telem_format(llama_context * ctx) {
                 (unsigned long long) d_ev, (unsigned long long) d_fb, copy_step, upd_step));
     }
 
-    // recommendation: layers whose cache barely beats the random baseline (n_slots/n_expert)
-    std::vector<int> cand;
-    for (const auto & kv : g_moe_telem.hist) {
-        if (kv.second.size() < 2) {
-            continue;
-        }
-        const auto & s  = kv.second.back().second;
-        const auto & s0 = kv.second.front().second;
-        const uint64_t hits = s.hits - s0.hits;
-        const uint64_t miss = s.miss - s0.miss;
-        if (s.n_expert <= 0 || s.n_slots <= 0 || miss == 0 || s.n_slots == s.n_expert) {
-            continue;
-        }
-        const double hit  = 100.0*(double)hits/(double)(hits + miss);
-        const double base = 100.0*(double)s.n_slots/(double)s.n_expert;
-        if (hit < 1.5*base) {
-            cand.push_back(kv.first);
-        }
+    st.t_out = now;
+    return out;
+}
+
+static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe_telem_state & st) {
+    std::vector<std::string> out;
+    if (!st.enabled || ctx == nullptr || st.layers_map.empty()) {
+        return out;
     }
-    if (!cand.empty()) {
+
+    // per-layer averages over the generation
+    std::map<int, double> miss_ps;   // miss per step
+    std::map<int, double> copy_ps;   // MiB per step
+    std::map<int, double> upd_ps;    // ms per step
+    std::map<int, double> hit_pct;   // mean hit %
+    std::map<int, double> hit_sig;   // sigma
+    std::map<int, int>    cur_slots;
+    std::map<int, int>    n_expert;
+    std::map<int, int>    dev_of;
+
+    double miss_sum = 0.0;
+    int    n_layers = 0;
+    int    max_layer = -1;
+    uint64_t total_steps = 0;
+
+    for (const auto & kv : st.layers_map) {
+        const int layer = kv.first;
+        const moe_telem_layer & l = kv.second;
+        if (l.n_hit == 0 || l.steps == 0) {
+            continue;
+        }
+        const double mean = l.sum_hit / l.n_hit;
+        const double var  = std::max(0.0, l.sum_hit2 / l.n_hit - mean*mean);
+        hit_pct[layer]   = mean;
+        hit_sig[layer]   = std::sqrt(var);
+        miss_ps[layer]   = (double) l.miss / (double) l.steps;
+        copy_ps[layer]   = (double) l.bytes / (double) l.steps / 1024.0 / 1024.0;
+        upd_ps[layer]    = (double) l.us / (double) l.steps / 1000.0;
+        cur_slots[layer] = l.prev.n_slots;
+        n_expert[layer]  = l.prev.n_expert;
+        dev_of[layer]    = l.prev.backend_id;
+        miss_sum += miss_ps[layer];
+        n_layers++;
+        max_layer = std::max(max_layer, layer);
+        total_steps = std::max(total_steps, l.steps);
+    }
+    if (n_layers == 0) {
+        return out;
+    }
+
+    out.push_back(string_format("moe summary: %d layers, %llu steps", n_layers, (unsigned long long) total_steps));
+    for (int layer = 0; layer <= max_layer; ++layer) {
+        auto it = hit_pct.find(layer);
+        if (it == hit_pct.end()) {
+            continue;
+        }
+        out.push_back(string_format("moe L%02d hit=%5.1f%%+-%4.1f%% miss=%.2f/stp copy=%.2fMiB/stp upd=%.2fms/stp",
+                layer, hit_pct[layer], hit_sig[layer], miss_ps[layer], copy_ps[layer], upd_ps[layer]));
+    }
+
+    // per-device totals
+    for (const auto & kv : st.dev) {
+        const moe_telem_dev & d = kv.second;
+        const double copy_ps_dev = d.steps ? (double) d.bytes / (double) d.steps / 1024.0 / 1024.0 : 0.0;
+        const double upd_ps_dev  = d.steps ? (double) d.us / (double) d.steps / 1000.0 : 0.0;
+        out.push_back(string_format("moe dev%d copy=%.2fMiB/stp upd=%.2fms/stp",
+                kv.first, copy_ps_dev, upd_ps_dev));
+    }
+
+    // --mec-per-layer: scale each layer's slots by its miss rate, then fit the current
+    // total (equalizing the hit/miss rate also evens out copy and upd)
+    const double mean_miss = miss_sum / n_layers;
+    if (mean_miss > 0.0) {
+        std::vector<int> sug(max_layer + 1, -1);
+        long sum_cur = 0;
+        long sum_sug = 0;
+        int first_layer = -1;
+        for (int layer = 0; layer <= max_layer; ++layer) {
+            auto it = miss_ps.find(layer);
+            if (it == miss_ps.end()) {
+                continue;
+            }
+            const int ne = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+            int val = (int) std::lround((double) cur_slots[layer] * it->second / mean_miss);
+            val = std::max(1, std::min(val, ne));
+            sug[layer] = val;
+            sum_cur += cur_slots[layer];
+            sum_sug += val;
+            if (first_layer < 0) {
+                first_layer = layer;
+            }
+        }
+        if (first_layer >= 0 && sum_sug != sum_cur) {
+            const int ne = n_expert[first_layer] > 0 ? n_expert[first_layer] : cur_slots[first_layer];
+            sug[first_layer] = std::max(1, std::min((int) (sug[first_layer] + (sum_cur - sum_sug)), ne));
+        }
         std::string list;
-        for (int l : cand) {
+        for (int layer = 0; layer <= max_layer; ++layer) {
             if (!list.empty()) {
                 list += ",";
             }
-            list += std::to_string(l);
+            if (sug[layer] < 0) {
+                list += "a";
+            } else {
+                list += std::to_string(sug[layer]);
+            }
         }
-        out.push_back(string_format("moe recommend: layers near the random baseline -> --mec-whole %s", list.c_str()));
+        out.push_back(string_format("moe recommend: --mec-per-layer %s", list.c_str()));
     }
 
-    g_moe_telem.t_out = now;
+    // --mec-whole: layers whose cache barely beats the random baseline
+    {
+        std::string list;
+        for (int layer = 0; layer <= max_layer; ++layer) {
+            auto it = hit_pct.find(layer);
+            if (it == hit_pct.end() || n_expert[layer] <= 0 || cur_slots[layer] <= 0 || cur_slots[layer] == n_expert[layer]) {
+                continue;
+            }
+            const double base = 100.0*(double) cur_slots[layer] / (double) n_expert[layer];
+            if (it->second < 1.5*base) {
+                if (!list.empty()) {
+                    list += ",";
+                }
+                list += std::to_string(layer);
+            }
+        }
+        if (!list.empty()) {
+            out.push_back(string_format("moe recommend: --mec-whole %s", list.c_str()));
+        }
+    }
+
+    // -ts suggestions: more layers towards the device with the lower per-step load
+    {
+        std::map<int, int> n_layers_dev;
+        for (const auto & kv : dev_of) {
+            if (kv.second >= 0) {
+                n_layers_dev[kv.second]++;
+            }
+        }
+
+        for (int mode = 0; mode < 2; ++mode) {
+            std::string list;
+            double wsum = 0.0;
+            std::vector<std::pair<int, double>> w;
+            for (const auto & kv : st.dev) {
+                const int b = kv.first;
+                const double load = mode == 0
+                    ? (kv.second.steps ? (double) kv.second.bytes / (double) kv.second.steps / 1024.0/1024.0 : 0.0)
+                    : (kv.second.steps ? (double) kv.second.us    / (double) kv.second.steps / 1000.0    : 0.0);
+                const int nl = n_layers_dev.count(b) ? n_layers_dev[b] : 1;
+                const double wgt = load > 1e-6 ? (double) nl / load : (double) nl;
+                w.push_back({b, wgt});
+                wsum += wgt;
+            }
+            if (wsum <= 0.0) {
+                continue;
+            }
+            for (size_t i = 0; i < w.size(); ++i) {
+                if (i > 0) {
+                    list += ",";
+                }
+                list += string_format("%.3f", w[i].second / wsum);
+            }
+            out.push_back(string_format("moe recommend: --ts %s (%s)",
+                    list.c_str(), mode == 0 ? "equalize copy, assumes similar PCIe bw" : "equalize upd per step per device"));
+        }
+    }
+
     return out;
 }
 
@@ -579,8 +775,13 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // per-layer MoE expert cache telemetry for the current generation
+    moe_telem_state moe_telem;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
+
+        moe_telem = moe_telem_state{};
 
         spec_is_replay = false;
 
@@ -809,7 +1010,7 @@ struct server_slot {
     }
 
     void print_timings_tg() {
-        moe_telem_sample(ctx_tgt);
+        moe_telem_sample(ctx_tgt, moe_telem);
 
         if (stats.n_gen < 100) {
             return;
@@ -864,9 +1065,18 @@ struct server_slot {
         }
 
         if (ctx_tgt != nullptr) {
-            for (const std::string & line : moe_telem_format(ctx_tgt)) {
+            for (const std::string & line : moe_telem_format(ctx_tgt, moe_telem)) {
                 SLT_INF(*this, "%s\n", line.c_str());
             }
+        }
+    }
+
+    void print_moe_summary() {
+        if (ctx_tgt == nullptr) {
+            return;
+        }
+        for (const std::string & line : moe_telem_summary(ctx_tgt, moe_telem)) {
+            SLT_INF(*this, "%s\n", line.c_str());
         }
     }
 
@@ -4140,6 +4350,7 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
+                slot.print_moe_summary();
                 send_final_response(slot);
                 slot.release();
 
@@ -4265,6 +4476,7 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    slot.print_moe_summary();
                     send_final_response(slot);
                     slot.release();
 

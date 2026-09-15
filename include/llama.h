@@ -622,6 +622,7 @@ extern "C" {
         int      backend_id;
         int      n_expert;
         int      n_slots;
+        int      n_expert_used; // model's top-k for this layer (0 = unknown)
         int      n_free;
         int      fully_resident;
         uint64_t n_hits;
