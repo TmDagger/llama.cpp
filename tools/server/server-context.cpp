@@ -661,7 +661,7 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 }
                 list += string_format("%.3f", w[i].second / wsum);
             }
-            out.push_back(string_format("moe recommend: --ts %s (%s; optimize --mec-per-layer first, then re-measure on a clean run; move towards the target in steps, watching for PCIe saturation or cache distortion)",
+            out.push_back(string_format("moe recommend: --ts %s (%s; requires --layer-split-strategy manual; optimize --mec-per-layer first, then re-measure on a clean run; move towards the target in steps, watching for PCIe saturation or cache distortion)",
                     list.c_str(), mode == 0 ? "equalize copy, assumes similar PCIe bw" : "equalize upd per step per device"));
         }
     }
