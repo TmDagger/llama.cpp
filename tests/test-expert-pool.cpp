@@ -144,10 +144,13 @@ static bool run_round(ggml_backend_sched_t sched, ggml_context * ctx, ggml_backe
     ggml_build_forward_expand(gf, out_gu);
     ggml_build_forward_expand(gf, out_dn);
 
-    if (!ggml_backend_sched_reserve(sched, gf)) {
-        fprintf(stderr, "%s: reserve failed\n", label);
-        return false;
-    }
+    // no reserve: sched_reserve would split this very graph, which rewrites the node
+    // srcs to the scheduler's copies; the later compute then re-splits against the
+    // rewritten graph, treats those copies as already-resident tensors, skips the
+    // input uploads and drifts the remap GET_ROWS out of its own split (the pool
+    // update then reads stale routing). every round builds a fresh graph, so reset
+    // before compute (the decode loop does the same) and let alloc_graph reserve.
+    ggml_backend_sched_reset(sched);
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: compute failed\n", label);
         return false;
