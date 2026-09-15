@@ -47,7 +47,7 @@ struct tensors {
 // binds a freshly created tensor to a host buffer and fills it with data
 template <typename T>
 static ggml_tensor * make_host_tensor(
-        ggml_context * ctx, ggml_backend_t backend, ggml_backend_buffer_type_t buft,
+        ggml_context * ctx, ggml_backend_buffer_type_t buft,
         ggml_type type, const int64_t * ne, int ndims, const std::vector<T> & data,
         bool is_input, const char * name) {
     ggml_tensor * t = ndims == 1 ? ggml_new_tensor_1d(ctx, type, ne[0])
@@ -92,15 +92,15 @@ static ggml_tensor * make_quant_host_tensor(
 // a [n_expert, n_tokens_max] I32 host tensor whose first n_used rows per column hold
 // the expert ids; strided [n_used, n_tokens] views of it feed the graphs, like the
 // output of ggml_argsort_top_k
-static void make_strided_ids(ggml_context * ctx, tensors & ts, ggml_backend_buffer_type_t accel_buft) {
+static void make_strided_ids(ggml_context * ctx, tensors & ts) {
     const int64_t ne_w[2] = { n_expert, n_tokens_max };
     std::vector<int32_t> wide_data((size_t) n_expert * n_tokens_max, n_expert - 1);
-    ts.ids_wide = make_host_tensor(ctx, nullptr, ggml_backend_cpu_buffer_type(), GGML_TYPE_I32,
+    ts.ids_wide = make_host_tensor(ctx, ggml_backend_cpu_buffer_type(), GGML_TYPE_I32,
             ne_w, 2, wide_data, false, "ids_wide");
 }
 
 // refresh the expert ids (first n_used rows of each column of the wide store)
-static void set_ids(ggml_backend_t accel, tensors & ts, int n_tokens,
+static void set_ids(tensors & ts, int n_tokens,
         const std::vector<int32_t> & ids_data) {
     std::vector<int32_t> wide((size_t) n_expert * n_tokens_max, n_expert - 1);
     for (int t = 0; t < n_tokens; t++) {
@@ -114,16 +114,16 @@ static void set_ids(ggml_backend_t accel, tensors & ts, int n_tokens,
 // build the pooled wrapper chain exactly like llm_graph_context::build_lora_mm_id;
 // the table is already [1, n_expert] and is fed to GET_ROWS directly (no reshape view),
 // so the remap itself anchors the pooled split and consumes the freshly uploaded table
-static ggml_tensor * pooled_ids(ggml_context * ctx, tensors & ts, int n_tokens,
+static ggml_tensor * pooled_ids(ggml_context * ctx, int n_tokens,
         ggml_tensor * table, ggml_tensor * ids_view) {
     ggml_tensor * ids_flat = ggml_cont(ctx, ids_view);
     ggml_tensor * slots = ggml_get_rows(ctx, table, ggml_reshape_1d(ctx, ids_flat, n_used * n_tokens));
     return ggml_reshape_2d(ctx, slots, n_used, n_tokens);
 }
 
-static bool run_round(ggml_backend_sched_t sched, ggml_context * ctx, ggml_backend_t accel,
+static bool run_round(ggml_backend_sched_t sched, ggml_context * ctx,
         tensors & ts, int n_tokens, const std::vector<int32_t> & ids_data, const char * label) {
-    set_ids(accel, ts, n_tokens, ids_data);
+    set_ids(ts, n_tokens, ids_data);
 
     ggml_tensor * ids_view = ggml_view_2d(ctx, ts.ids_wide, n_used, n_tokens, ts.ids_wide->nb[1], 0);
     ggml_set_input(ids_view);
@@ -138,9 +138,9 @@ static bool run_round(ggml_backend_sched_t sched, ggml_context * ctx, ggml_backe
 
     // pooled variants sharing one routing (like fused gate_up + down MoE layers)
     ggml_tensor * out_gu = ggml_mul_mat_id(ctx, ts.pool_gu, x3,
-            pooled_ids(ctx, ts, n_tokens, ts.table_gu, ids_view));
+            pooled_ids(ctx, n_tokens, ts.table_gu, ids_view));
     ggml_tensor * out_dn = ggml_mul_mat_id(ctx, ts.pool_dn, x3,
-            pooled_ids(ctx, ts, n_tokens, ts.table_dn, ids_view));
+            pooled_ids(ctx, n_tokens, ts.table_dn, ids_view));
 
     ggml_build_forward_expand(gf, ref_gu);
     ggml_build_forward_expand(gf, ref_dn);
@@ -237,8 +237,8 @@ int main() {
         ts.w_gu = make_quant_host_tensor(tctx, bufts[1], type, ne_w, w_data, "w_gu");
         ts.w_dn = make_quant_host_tensor(tctx, bufts[1], type, ne_w, w_data, "w_dn");
         const int64_t ne_x[2] = { n_in, n_tokens_max };
-        ts.x = make_host_tensor(tctx, nullptr, bufts[1], GGML_TYPE_F32, ne_x, 2, x_data, true, "x");
-        make_strided_ids(tctx, ts, accel_buft);
+        ts.x = make_host_tensor(tctx, bufts[1], GGML_TYPE_F32, ne_x, 2, x_data, true, "x");
+        make_strided_ids(tctx, ts);
 
         ts.pool_gu = ggml_backend_sched_register_expert_pool(sched, ts.w_gu, 0, n_slots, &ts.table_gu);
         ts.pool_dn = ggml_backend_sched_register_expert_pool(sched, ts.w_dn, 0, n_slots, &ts.table_dn);
@@ -262,19 +262,19 @@ int main() {
 
             // round 1: cold pool, low experts are loaded
             snprintf(label, sizeof(label), "%s nt=%d round1 (cold)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+            ok &= run_round(sched, gctx, ts, n_tokens,
                     mmq_case ? std::vector<int32_t>{0,1, 2,3, 4,5, 6,7, 8,9, 10,11, 12,13, 14,15, 0,1}
                              : std::vector<int32_t>{0, 1, 2, 1, 3, 0}, label);
 
             // round 2: unseen experts miss and evict everything
             snprintf(label, sizeof(label), "%s nt=%d round2 (full eviction)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+            ok &= run_round(sched, gctx, ts, n_tokens,
                     mmq_case ? std::vector<int32_t>{16,17, 18,19, 20,21, 22,23, 24,25, 26,27, 28,29, 30,31, 16,17}
                              : std::vector<int32_t>{4, 5, 6, 4, 7, 5}, label);
 
             // round 3: hits plus evicted-expert reloads
             snprintf(label, sizeof(label), "%s nt=%d round3 (hit + reload)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+            ok &= run_round(sched, gctx, ts, n_tokens,
                     mmq_case ? std::vector<int32_t>{16,17, 0,1, 2,3, 16,17, 0,1, 2,3, 16,17, 0,1, 16,17}
                              : std::vector<int32_t>{4, 0, 1, 4, 0, 1}, label);
 
@@ -282,7 +282,7 @@ int main() {
             ggml_free(gctx);
             gctx = ggml_init(gp);
             snprintf(label, sizeof(label), "%s nt=%d round4 (after graph rebuild)", ggml_type_name(type), n_tokens);
-            ok &= run_round(sched, gctx, accel, ts, n_tokens,
+            ok &= run_round(sched, gctx, ts, n_tokens,
                     mmq_case ? std::vector<int32_t>{4,5, 4,5, 6,7, 6,7, 4,5, 4,5, 6,7, 6,7, 4,5}
                              : std::vector<int32_t>{2, 3, 2, 3, 2, 3}, label);
 
