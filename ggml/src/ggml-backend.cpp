@@ -2038,18 +2038,18 @@ static void ggml_backend_sched_update_expert_pool(
     }
     ep.updated = true;
 
-    // the table upload below overwrites the device map table that the previous ubatch's
-    // remap GET_ROWS and pooled MUL_MAT_ID may still be reading (the pool owns a single
-    // table copy, not the double-buffered scheduler input copies), and the read-back of
-    // the ids must wait for the router that produced them: synchronize once here
-    ggml_backend_synchronize(split_backend);
-
     if (ids != sched->expert_ids_tensor) {
         // the ids are produced by a previous split on the compute backend
         const size_t ids_nbytes = ggml_nbytes(ids);
         sched->expert_ids_host.resize(ids_nbytes / sizeof(int32_t));
         // note: the sync get is intentional - the async variants of some backends (e.g. Metal)
-        // require page-aligned host buffers for zero-copy reads, which a std::vector is not
+        // require page-aligned host buffers for zero-copy reads, which a std::vector is not.
+        // this synchronize also covers the table rewrite + upload below: the H2D copy is
+        // enqueued on the same stream the kernels that read the table run on, so once the
+        // previous ubatch has drained here, stream order alone keeps the single device
+        // table copy safe - no extra per-pool sync (one queue-wide wait per ubatch is
+        // already visible as a decode-t/s regression on vulkan)
+        ggml_backend_synchronize(split_backend);
         ggml_backend_tensor_get(ids, sched->expert_ids_host.data(), 0, ids_nbytes);
         sched->expert_ids_tensor = ids;
     }
@@ -2113,18 +2113,23 @@ static void ggml_backend_sched_update_expert_pool(
         ep.slot_stamp[slot]  = ++ep.stamp;
         table[e] = slot;
 
-        // copy the expert from the host weights into its slot
-        ggml_backend_tensor_set_async(split_backend, ep.pool,
+        // copy the expert from the host weights into its slot. synchronous on purpose:
+        // this matches the stock selective-copy path (the ubatch cannot proceed before
+        // the expert data lands anyway), and an async copy would race the compute queue
+        // reading the slot on backends with a dedicated transfer queue
+        ggml_backend_tensor_set(ep.pool,
             (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size,
             (size_t) slot * ep.expert_size,
             ep.expert_size);
     }
 
-    // upload the rewritten table to the device copy that the remap GET_ROWS reads; the
-    // copy is enqueued on the split stream, so it is ordered before the remap kernel.
-    // the table is pool-owned (not a scheduler split input), which keeps the update ->
-    // upload -> remap order under the pool's own control
-    ggml_backend_tensor_set_async(split_backend, ep.table_dev, ep.table->data, 0, ggml_nbytes(ep.table));
+    // upload the rewritten table to the device copy that the remap GET_ROWS reads. the
+    // copy is deliberately synchronous: backends with a dedicated transfer queue (e.g.
+    // vulkan) would otherwise leave this 128-byte write unordered against the compute
+    // queue that reads the table, and a synchronous copy of this size is free next to
+    // the expert uploads. the table is pool-owned (not a scheduler split input), which
+    // keeps the update -> upload -> remap order under the pool's own control
+    ggml_backend_tensor_set(ep.table_dev, ep.table->data, 0, ggml_nbytes(ep.table));
 
     if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
         ep.n_reports++;
