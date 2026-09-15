@@ -802,7 +802,6 @@ struct ggml_backend_sched_expert_pool {
 
     // telemetry
     std::vector<int64_t>  expert_load_us;   // [n_expert] last load time (0 = never)
-    std::vector<uint64_t> expert_load_step; // [n_expert] step of last load
     uint64_t step = 0;                      // pool updates seen
 
     // running totals, reported when GGML_MOE_POOL_STATS is set
@@ -812,6 +811,7 @@ struct ggml_backend_sched_expert_pool {
     uint64_t n_fallback = 0;
     uint64_t bytes_copied = 0;
     uint64_t us_update = 0;
+    uint64_t sum_lifetime_us = 0;           // total lifetime of evicted experts
     bool report_stats = false;
     uint64_t n_reports = 0;
 };
@@ -2113,7 +2113,11 @@ static void ggml_backend_sched_update_expert_pool(
             // the routing graph guarantees that at most n_slots distinct experts are used;
             // if this fires, a graph with more experts than slots was routed through the pool
             GGML_ASSERT(ep.slot_stamp[slot] <= stamp_base && "expert pool overflow: the ubatch uses more distinct experts than there are slots");
-            ep.expert_slot[ep.slot_expert[slot]] = -1;
+            const int32_t evicted = ep.slot_expert[slot];
+            if (evicted >= 0 && ep.expert_load_us[evicted] != 0) {
+                ep.sum_lifetime_us += (uint64_t) (t_start - ep.expert_load_us[evicted]);
+            }
+            ep.expert_slot[evicted] = -1;
             ep.n_evict++;
         }
 
@@ -2124,9 +2128,8 @@ static void ggml_backend_sched_update_expert_pool(
             table[e] = slot;
         }
 
-        ep.expert_load_us[e]   = t_start;
-        ep.expert_load_step[e] = ep.step;
-        ep.bytes_copied       += ep.expert_size;
+        ep.expert_load_us[e] = t_start;
+        ep.bytes_copied     += ep.expert_size;
 
         // copy the expert from the host weights into its slot
         ggml_backend_tensor_set_async(split_backend, ep.pool,
@@ -2259,7 +2262,6 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.slot_stamp.assign(n_slots, 0);
     ep.slot_pinned.assign(n_slots, 0);
     ep.expert_load_us.assign(n_expert, 0);
-    ep.expert_load_step.assign(n_expert, 0);
     ep.n_free  = n_slots;
     ep.n_pinned = 0;
     ep.stamp   = 0;
@@ -2392,16 +2394,11 @@ void ggml_backend_sched_expert_pool_note_fallback(
 
 int ggml_backend_sched_get_expert_pool_records(
         ggml_backend_sched_t sched,
-        int64_t now_us,
         struct ggml_backend_sched_expert_pool_record * records,
         int max_records) {
     if (sched == NULL || records == NULL || max_records <= 0) {
         return 0;
     }
-    if (now_us <= 0) {
-        now_us = ggml_time_us();
-    }
-    static const int64_t win_us[3] = { 1000*1000, 10*1000*1000, 60*1000*1000 };
 
     int n = 0;
     for (const auto & ep : sched->expert_pools) {
@@ -2411,40 +2408,20 @@ int ggml_backend_sched_get_expert_pool_records(
         struct ggml_backend_sched_expert_pool_record & r = records[n];
         memset(&r, 0, sizeof(r));
         snprintf(r.name, sizeof(r.name), "%s", ep.w->name);
-        r.layer          = ep.layer;
-        r.backend_id     = ep.backend_id;
-        r.n_expert       = ep.n_expert;
-        r.n_slots        = ep.n_slots;
-        r.n_free         = ep.n_free;
-        r.fully_resident = ep.fully_resident ? 1 : 0;
-        r.n_hits         = ep.n_hits;
-        r.n_misses       = ep.n_misses;
-        r.n_evict        = ep.n_evict;
-        r.n_fallback     = ep.n_fallback;
-        r.bytes_copied   = ep.bytes_copied;
-        r.us_update      = ep.us_update;
-        r.step           = ep.step;
-
-        for (int w = 0; w < 3; ++w) {
-            for (int e = 0; e < ep.n_expert; ++e) {
-                const int64_t t = ep.expert_load_us[e];
-                if (t == 0 || now_us - t > win_us[w]) {
-                    continue;
-                }
-                r.n_loaded[w]++;
-                if (ep.expert_slot[e] >= 0) {
-                    r.n_resident[w]++;
-                }
-            }
-        }
-        for (int e = 0; e < ep.n_expert; ++e) {
-            if (ep.expert_load_step[e] != 0 && ep.expert_load_step[e] == ep.step) {
-                r.n_loaded[3]++;
-                if (ep.expert_slot[e] >= 0) {
-                    r.n_resident[3]++;
-                }
-            }
-        }
+        r.layer           = ep.layer;
+        r.backend_id      = ep.backend_id;
+        r.n_expert        = ep.n_expert;
+        r.n_slots         = ep.n_slots;
+        r.n_free          = ep.n_free;
+        r.fully_resident  = ep.fully_resident ? 1 : 0;
+        r.n_hits          = ep.n_hits;
+        r.n_misses        = ep.n_misses;
+        r.n_evict         = ep.n_evict;
+        r.n_fallback      = ep.n_fallback;
+        r.bytes_copied    = ep.bytes_copied;
+        r.us_update       = ep.us_update;
+        r.step            = ep.step;
+        r.sum_lifetime_us = ep.sum_lifetime_us;
         n++;
     }
     return n;

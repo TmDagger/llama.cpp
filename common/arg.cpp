@@ -2921,6 +2921,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WHOLE"));
     add_opt(common_arg(
+        {"--mec-per-layer", "--moe-expert-cache-per-layer"}, "N0,N1,... | L:N | a",
+        "slots per expert tensor for individual layers, positional (in layer order) and/or as\n"
+        "L:N pairs; use 'a' for a dynamic layer that follows --moe-expert-cache and 0 to\n"
+        "disable the cache for that layer. explicit values are reserved from the budget first,\n"
+        "the dynamic layers scale down to fit (requires --moe-expert-cache)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_per_layer.clear();
+
+            const auto ensure = [&](int idx) {
+                if ((int) params.expert_cache_per_layer.size() <= idx) {
+                    params.expert_cache_per_layer.resize(idx + 1, -1);
+                }
+            };
+
+            int pos = 0;
+            std::stringstream ss(value);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (tok.empty()) {
+                    continue;
+                }
+                if (tok == "a" || tok == "A") {
+                    ensure(pos);
+                    params.expert_cache_per_layer[pos] = -1;
+                    pos++;
+                    continue;
+                }
+                const size_t colon = tok.find(':');
+                if (colon != std::string::npos) {
+                    const int idx = std::stoi(tok.substr(0, colon));
+                    const int v   = std::stoi(tok.substr(colon + 1));
+                    if (idx < 0 || v < 0) {
+                        throw std::invalid_argument("invalid layer or value");
+                    }
+                    ensure(idx);
+                    params.expert_cache_per_layer[idx] = v;
+                    continue;
+                }
+                const int v = std::stoi(tok);
+                if (v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                ensure(pos);
+                params.expert_cache_per_layer[pos] = v;
+                pos++;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_PER_LAYER"));
+    add_opt(common_arg(
         {"--moe-pool-pcie-bw"}, "GB/S",
         "PCIe bandwidth in GB/s for the h* = 1 - PCIe/RAM break-even estimate (0 = unset)",
         [](common_params & params, const std::string & value) {

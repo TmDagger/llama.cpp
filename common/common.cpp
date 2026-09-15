@@ -1290,9 +1290,46 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static int64_t common_gguf_tensor_bytes(const std::string & path) {
+    struct ggml_context * ctx = nullptr;
+    struct gguf_init_params gp = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx,
+    };
+    struct gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        return 0;
+    }
+
+    int64_t total = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        total += (int64_t) ggml_nbytes(t);
+    }
+
+    gguf_free(g);
+    if (ctx != nullptr) {
+        ggml_free(ctx);
+    }
+    return total;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     common_params_apply_layer_split_strategy(params);
+
+    // hold back VRAM for an external speculative draft: its weights are loaded after the
+    // target context, so the target expert cache must not consume all the free VRAM
+    if (params.speculative.has_dft()) {
+        const std::string & draft_path = params.speculative.draft.mparams.path;
+        if (!draft_path.empty()) {
+            const int64_t draft_bytes = common_gguf_tensor_bytes(draft_path);
+            if (draft_bytes > 0) {
+                params.expert_cache_external_reserve = draft_bytes;
+                COM_INF("%s: reserving %.2f GiB for the speculative draft model\n",
+                        __func__, draft_bytes / 1024.0 / 1024.0 / 1024.0);
+            }
+        }
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1946,6 +1983,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_whole_count = params.expert_cache_whole_count;
     cparams.expert_cache_whole_layers = params.expert_cache_whole_layers.empty() ? nullptr : params.expert_cache_whole_layers.data();
     cparams.n_expert_cache_whole_layers = (int32_t) params.expert_cache_whole_layers.size();
+    cparams.expert_cache_per_layer = params.expert_cache_per_layer.empty() ? nullptr : params.expert_cache_per_layer.data();
+    cparams.n_expert_cache_per_layer = (int32_t) params.expert_cache_per_layer.size();
+    cparams.expert_cache_external_reserve = (int64_t) params.expert_cache_external_reserve;
     cparams.expert_cache_rail_mb = params.expert_cache_rail_mb.empty() ? nullptr : params.expert_cache_rail_mb.data();
     cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 

@@ -37,6 +37,10 @@ struct llama_cparams {
     // keep all experts of the first N layers resident (0 = off) and/or an explicit layer list
     int32_t  expert_cache_whole_count = 0;
     std::vector<int32_t> expert_cache_whole_layers;
+    // per-layer slot counts (-1 = dynamic) [EXPERIMENTAL]
+    std::vector<int32_t> expert_cache_per_layer;
+    // VRAM (bytes) held back for other contexts (draft/MTP), spread across devices
+    size_t expert_cache_external_reserve = 0;
 
     float rope_freq_base;
     float rope_freq_scale;

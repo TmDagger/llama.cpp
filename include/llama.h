@@ -382,6 +382,9 @@ extern "C" {
         int32_t  expert_cache_whole_count; // keep all experts of the first N layers resident (0 = off) [EXPERIMENTAL]
         const int32_t * expert_cache_whole_layers; // explicit layers to keep fully resident; null = none [EXPERIMENTAL]
         int32_t  n_expert_cache_whole_layers; // number of entries in expert_cache_whole_layers [EXPERIMENTAL]
+        const int32_t * expert_cache_per_layer; // per-layer slot counts, -1 = dynamic; null = all dynamic [EXPERIMENTAL]
+        int32_t  n_expert_cache_per_layer;      // number of entries in expert_cache_per_layer [EXPERIMENTAL]
+        int64_t  expert_cache_external_reserve; // VRAM (bytes) held back for other contexts, spread across devices [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -612,9 +615,7 @@ extern "C" {
 
     LLAMA_API void llama_get_expert_pool_stats(const struct llama_context * ctx, struct llama_expert_pool_stats * stats);
 
-    // Per-pool expert cache telemetry (debug). Residency window order:
-    // 0 = last 1 s, 1 = last 10 s, 2 = last 60 s, 3 = last decode step.
-    #define LLAMA_EXPERT_POOL_MAX_WINDOWS 4
+    // Per-pool expert cache telemetry (debug).
     struct llama_expert_pool_record {
         char     name[128];
         int      layer;
@@ -630,15 +631,12 @@ extern "C" {
         uint64_t bytes_copied;
         uint64_t us_update;
         uint64_t step;
-        uint64_t n_loaded  [LLAMA_EXPERT_POOL_MAX_WINDOWS];
-        uint64_t n_resident[LLAMA_EXPERT_POOL_MAX_WINDOWS];
+        uint64_t sum_lifetime_us;
     };
 
     // Fill up to max_records per-pool records; returns the number written.
-    // now_us <= 0 lets the implementation pick the current time.
     LLAMA_API int llama_get_expert_pool_records(
         const struct llama_context * ctx,
-        int64_t now_us,
         struct llama_expert_pool_record * records,
         int max_records);
 

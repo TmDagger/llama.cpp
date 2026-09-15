@@ -2517,6 +2517,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    // the draft/MTP context does not own the expert cache: a second set of pools would
+    // waste VRAM, and the target pools are sized before the draft model is loaded
+    result.expert_cache_slots             = 0;
+    result.expert_cache_slots_per_dev.clear();
+    result.expert_cache_whole_count       = 0;
+    result.expert_cache_whole_layers.clear();
+    result.expert_cache_per_layer.clear();
+    result.split_by_cache_slots           = false;
+    result.expert_cache_external_reserve  = 0;
+
     return result;
 }
 
