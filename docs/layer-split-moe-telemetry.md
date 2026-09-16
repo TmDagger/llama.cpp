@@ -135,6 +135,10 @@ moe recommend: --ts 0.335,0.665 (equalize upd ...)
   the remaining layers (`avg_whole < 0.8 * avg_off`), the recommendation switches to
   `--mec-per-layer 0,...` instead: those layers run the stock host path and their slots
   go to the layers where the cache does help.
+- Host-pinned layers (`--mec-per-layer 0`) have no pool, so the telemetry cannot see
+  them. The suggestions keep them at `0` and exclude them from the redistribution, and a
+  `moe note` line lists them. The pin changes the slot distribution, so remove it for a
+  clean baseline measurement.
 - `--ts`: two variants, one balancing copied bytes and one balancing updater time per
   device. Both assume you optimize the slots first and then move towards the target in
   steps, watching for PCIe saturation.
@@ -143,8 +147,10 @@ moe recommend: --ts 0.335,0.665 (equalize upd ...)
 
 - `ggml_backend_sched_update_expert_pool: '<tensor>' hit rate X% (...), N of M slots free`
   (needs `-lv 4`): cumulative per-tensor counters, printed every 512 events.
-- `init_expert_pools: expert pool budget ... (free ... - compute ... - rail ... - external ...)`:
-  how the per-device budget was computed.
+- `init_expert_pools: expert pool budget ... (free ... - compute ... - rail ... -
+  external, ... already consumed)`: how the per-device budget was computed. The external
+  reserve for a draft/MTP context is held back only for the part not consumed yet, so a
+  re-reserve after the draft has loaded does not subtract it a second time.
 - `init_expert_pools: <dev>: requested slots do not fit ... scaled to X%`: the uniform
   downscale that keeps the pools inside the budget.
 - A warning when less than about 384 MiB would stay free after the compute buffers,
@@ -175,9 +181,10 @@ trade. Pinning them whole spends a full `n_expert` slots per layer, which the us
 layers pay for with a lower hit rate; running them on the CPU frees those slots, and the
 DDR path is often wider than an already saturated PCIe link (a single PCIe 5.0 x16 card
 was measured at ~22-24 GB/s, while part of the traffic also goes to the second card on
-PCIe 4.0 x4). For DeepSeek-V4-Flash, sending the 3 uniform layers to the CPU with
-`--mec-per-layer 0,0,0` and giving their slots to the rest measured 11.47 t/s against
-10.03 t/s for `--mec-whole 0-2`. On a single card the difference is smaller.
+PCIe 4.0 x4). For DeepSeek-V4-Flash with `-mec 128`: baseline 10.07 t/s, `--mec-whole
+0-2` 9.54 t/s (the whole pin pushed dev0 from 328 to 462 MiB/step of copies), while
+`--mec-per-layer 0,0,0` reached 11.74 t/s and roughly halved dev0's copy and update load.
+On a single card the difference is smaller.
 
 ### 4.3 Tuning scenario
 
@@ -188,7 +195,8 @@ PCIe 4.0 x4). For DeepSeek-V4-Flash, sending the 3 uniform layers to the CPU wit
    starve the other layers, send them to the host path with `--mec-per-layer 0,0,0`.
    Both move the cache budget to the layers where it helps.
 4. Re-run and apply the suggested `--mec-per-layer` (it keeps each card's slot total
-   unchanged). Compare `copy`/`upd` and t/s.
+   unchanged; host-pinned layers stay `0`). Compare `copy`/`upd` and t/s. To get a clean
+   baseline for the active layers, re-measure once without the host pin.
 5. Only then look at `--ts`: pick a `-ts` suggestion (copy or upd), set
    `--layer-split-strategy manual` and move towards the target in a few steps. After
    each step re-check the summary for PCIe saturation or a distorted target ratio, which

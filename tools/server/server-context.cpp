@@ -477,11 +477,18 @@ static std::vector<std::string> moe_telem_format(llama_context * ctx, moe_telem_
     return out;
 }
 
-static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe_telem_state & st) {
+static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe_telem_state & st, const std::vector<int> & host_layers) {
     std::vector<std::string> out;
     if (!st.enabled || ctx == nullptr || st.layers_map.empty()) {
         return out;
     }
+
+    // layers the user pinned to the host path (--mec-per-layer 0): they have no pool, so the
+    // telemetry cannot see them, but the suggestions must keep them at 0 instead of turning
+    // them back into dynamic layers
+    const auto is_host = [&](int layer) {
+        return std::find(host_layers.begin(), host_layers.end(), layer) != host_layers.end();
+    };
 
     // per-layer averages over the generation
     std::map<int, double> miss_ps;   // miss per step
@@ -523,6 +530,11 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
         return out;
     }
 
+    int max_layer_all = max_layer;
+    for (int layer : host_layers) {
+        max_layer_all = std::max(max_layer_all, layer);
+    }
+
     out.push_back(string_format("moe summary: %d layers, %llu steps", n_layers, (unsigned long long) total_steps));
     for (int layer = 0; layer <= max_layer; ++layer) {
         auto it = hit_pct.find(layer);
@@ -542,16 +554,27 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 kv.first, copy_ps_dev, upd_ps_dev));
     }
 
+    if (!host_layers.empty()) {
+        std::string list;
+        for (int layer : host_layers) {
+            if (!list.empty()) {
+                list += ",";
+            }
+            list += std::to_string(layer);
+        }
+        out.push_back(string_format("moe note: layers %s are pinned to host (--mec-per-layer 0); they stay 0 in the suggestions; remove the pin for a clean baseline", list.c_str()));
+    }
+
     // --mec-per-layer: nudge every layer's slots by how far its hit rate deviates from the
     // device average, divided by the layer's hit chance per slot (a slot buys less where the
     // routing is already concentrated). The per-device total is preserved by scaling, and the
     // clamps keep the suggestion inside the model's expert range.
     {
-        std::vector<int> sug(max_layer + 1, -1);
+        std::vector<int> sug(max_layer_all + 1, -1);
 
         std::map<int, std::vector<int>> by_dev;
         for (int layer = 0; layer <= max_layer; ++layer) {
-            if (hit_pct.find(layer) == hit_pct.end()) {
+            if (hit_pct.find(layer) == hit_pct.end() || is_host(layer)) {
                 continue;
             }
             by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
@@ -604,8 +627,15 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
             sug[layer] = std::max(nmin, std::min((int) (sug[layer] + (sum_cur - sum_sug)), ne));
         }
 
+        // host-pinned layers stay off; their budget is not touched
+        for (int layer : host_layers) {
+            if (layer >= 0 && layer <= max_layer_all) {
+                sug[layer] = 0;
+            }
+        }
+
         std::string list;
-        for (int layer = 0; layer <= max_layer; ++layer) {
+        for (int layer = 0; layer <= max_layer_all; ++layer) {
             if (!list.empty()) {
                 list += ",";
             }
@@ -627,13 +657,13 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
     {
         std::map<int, std::vector<int>> by_dev;
         for (int layer = 0; layer <= max_layer; ++layer) {
-            if (hit_pct.find(layer) == hit_pct.end()) {
+            if (hit_pct.find(layer) == hit_pct.end() || is_host(layer)) {
                 continue;
             }
             by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
         }
 
-        std::vector<int> off_layers;
+        std::vector<int> sup_layers;
         std::string      whole_list;
         double           msg_avg_whole = 0.0;
         double           msg_avg_off   = 0.0;
@@ -668,7 +698,7 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 const double avg_off   = (double) sum_cur / (double) n_rem;
                 const double avg_whole = std::max(0.0, (double) sum_cur - whole_slots) / (double) n_rem;
                 if (avg_whole < 0.8*avg_off) {
-                    off_layers.insert(off_layers.end(), uni.begin(), uni.end());
+                    sup_layers.insert(sup_layers.end(), uni.begin(), uni.end());
                     if (!msg_set) {
                         msg_avg_whole = avg_whole;
                         msg_avg_off   = avg_off;
@@ -685,13 +715,13 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
             }
         }
 
-        if (!off_layers.empty()) {
+        if (!sup_layers.empty()) {
             std::string list;
-            for (int layer = 0; layer <= max_layer; ++layer) {
+            for (int layer = 0; layer <= max_layer_all; ++layer) {
                 if (!list.empty()) {
                     list += ",";
                 }
-                if (std::find(off_layers.begin(), off_layers.end(), layer) != off_layers.end()) {
+                if (is_host(layer) || std::find(sup_layers.begin(), sup_layers.end(), layer) != sup_layers.end()) {
                     list += "0";
                 } else {
                     list += "a";
@@ -878,6 +908,10 @@ struct server_slot {
 
     // per-layer MoE expert cache telemetry for the current generation
     moe_telem_state moe_telem;
+
+    // layers pinned to the host path (--mec-per-layer 0), from the launch params; not reset
+    // per generation because it is part of the launch config
+    std::vector<int> moe_off_layers;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -1176,7 +1210,7 @@ struct server_slot {
         if (ctx_tgt == nullptr) {
             return;
         }
-        for (const std::string & line : moe_telem_summary(ctx_tgt, moe_telem)) {
+        for (const std::string & line : moe_telem_summary(ctx_tgt, moe_telem, moe_off_layers)) {
             SLT_INF(*this, "%s\n", line.c_str());
         }
     }
@@ -1819,6 +1853,16 @@ private:
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
+        }
+
+        // layers explicitly sent to the host path (--mec-per-layer 0): the telemetry
+        // suggestions must keep them at 0 instead of turning them dynamic again
+        for (size_t l = 0; l < params_base.expert_cache_per_layer.size(); ++l) {
+            if (params_base.expert_cache_per_layer[l] == 0) {
+                for (auto & slot : slots) {
+                    slot.moe_off_layers.push_back((int) l);
+                }
+            }
         }
 
         // try speculative decoding
