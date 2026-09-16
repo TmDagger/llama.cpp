@@ -218,7 +218,50 @@ On a single card the difference is smaller.
 6. If a device warns about low headroom, raise `--moe-expert-cache-rail-mb` for it
    (comma list, device order).
 
-## 5. Limitations and caveats
+## 5. Speculative draft placement and cache
+
+The draft model is a separate context loaded after the target. Two things matter: where it
+lands, and how much VRAM it takes from the target cache.
+
+### 5.1 DSpark on the last device
+
+DSpark reads the target's last hidden state and shares its `lm_head`, both of which live on
+the last device under layer split (`get_layer_buft_list(n_layer_all)`). With
+`--spec-draft-model` and no `-devd`, the draft is pinned to the last offload device, the
+whole external reserve is held on that device instead of being spread, and the layer split
+reserves the draft's bytes there (`slots` subtracts them from the last device's capacity,
+`bw`/`eq` scale its share down). The last device therefore gets fewer target layers, so its
+expert cache keeps a useful size next to the draft.
+
+### 5.2 MoE draft cache
+
+A MoE DSpark draft kept all its experts resident on the GPU (6.48 GiB in the test), which
+starved the target cache. When the target has `-mec > 0` and the user did not pin the draft
+experts (`-cmoed` / `-ncmoed`), the draft gets the same treatment as the target: its
+experts go to the CPU and the hot ones are cached on the GPU. `--spec-draft-mec` overrides
+the level, the default inherits `-mec`. The reserve is then the draft's GPU footprint
+(dense tensors plus cache slots, not the whole GGUF), computed from the draft's GGUF with
+the same regex the loader uses. The draft pool budget uses the draft's own hparams
+(`n_expert`, expert size), so a draft with a different expert count than the target works
+too.
+
+### 5.3 Measured trade-off
+
+The draft cache and the target cache compete for the same VRAM: more draft slots lower the
+draft latency, but they shrink the target's pools and raise the target latency. On
+DeepSeek-V4-Flash with `-ncmoe 99` the RAM-PCIe link is the bottleneck, so the target cache
+matters more and pure CPU experts for the draft (`--spec-draft-mec 0`) was the better
+setting. The auto path is a starting point; measure `copy`/`upd` and t/s with and without
+`--spec-draft-mec`.
+
+### 5.4 Other draft types
+
+The auto placement is DSpark-only for now. EAGLE-3 exposes its attachment in the metadata
+(`eagle3.target_layers`, e.g. `[2, 12, 21]` for gpt-oss-20b) and has a 1-layer draft, so
+its hidden states come from early/mid layers, likely on the first device - it needs its own
+placement rule. DFlash and MTP are not handled yet.
+
+## 6. Limitations and caveats
 
 - Prefill and any ubatch wider than the pool fall back to the host-copy path
   (`fb`), so prefill never uses the pool and never flushes it.
@@ -230,10 +273,11 @@ On a single card the difference is smaller.
   any token. All knobs are static, applied at load.
 - `--mec-whole` and `--mec-per-layer` values are guaranteed only if they fit the device
   budget; otherwise they are demoted to dynamic with a warning.
-- Speculative draft/MTP contexts do not share the target cache; the target reserves the
-  draft's tensor bytes (from GGUF metadata) when sizing its pools.
+- A MoE DSpark draft can run its own expert cache (`--spec-draft-mec`, default inherited
+  from `-mec`); other draft/MTP contexts do not. The target reserves the draft's GPU
+  footprint (dense tensors plus cache slots) when sizing its pools.
 
-## 6. Backlog
+## 7. Backlog
 
 - Adaptive cache slots at runtime (requires re-creating pools and re-reserving graphs).
 - Rotating hot-expert lists: a logical hot/cold split of one pool, eviction by
@@ -241,3 +285,7 @@ On a single card the difference is smaller.
   shift. The logical split avoids reallocation, so it is feasible; the burst logging is
   the first step.
 - Session-wide telemetry aggregation (separate toggle).
+- Draft placement for EAGLE-3 (reads `eagle3.target_layers`, early/mid layers), DFlash and
+  MTP; the current auto rule is DSpark-only.
+- Draft cache tuning: pick the draft cache level from the measured trade-off (or make the
+  auto path opt-in) instead of always inheriting `-mec`.
