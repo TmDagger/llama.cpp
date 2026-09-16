@@ -46,8 +46,10 @@ cached in VRAM).
   and shares `lm_head`, both of which live there), and the layer split reserves the
   draft's bytes on that device: `slots` subtracts them from the last device's capacity,
   `bw`/`eq` scale its share down proportionally. The external reserve is also held on that
-  device instead of being spread. The draft still fits if the reserve is spread, but the
-  last device's expert cache would be starved.
+  device instead of being spread. The reserve follows the draft's CPU tensor overrides
+  (`-cmoed` / `-ncmoed`): experts kept on the CPU do not count against the reserve, which
+  keeps the target expert cache on that device nearly intact. The draft still fits if the
+  reserve is spread, but the last device's expert cache would be starved.
 
 ### 2.2 Expert cache
 

@@ -1290,7 +1290,10 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-static int64_t common_gguf_tensor_bytes(const std::string & path) {
+// sum of the tensor bytes that will live on the GPU: tensors matched by a CPU tensor
+// override are excluded, so the reserve follows -cmoed/-ncmoed. partial offload via
+// n_gpu_layers is not accounted for (the draft is normally loaded with all layers offloaded)
+static int64_t common_gguf_tensor_bytes(const std::string & path, const std::vector<llama_model_tensor_buft_override> & overrides) {
     struct ggml_context * ctx = nullptr;
     struct gguf_init_params gp = {
         /*.no_alloc = */ true,
@@ -1303,6 +1306,22 @@ static int64_t common_gguf_tensor_bytes(const std::string & path) {
 
     int64_t total = 0;
     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        bool on_cpu = false;
+        for (const auto & ov : overrides) {
+            if (ov.pattern == nullptr) {
+                break;
+            }
+            if (ov.buft != ggml_backend_cpu_buffer_type()) {
+                continue;
+            }
+            if (std::regex_search(std::string(t->name), std::regex(ov.pattern))) {
+                on_cpu = true;
+                break;
+            }
+        }
+        if (on_cpu) {
+            continue;
+        }
         total += (int64_t) ggml_nbytes(t);
     }
 
@@ -1321,7 +1340,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.speculative.has_dft()) {
         const std::string & draft_path = params.speculative.draft.mparams.path;
         if (!draft_path.empty()) {
-            const int64_t draft_bytes = common_gguf_tensor_bytes(draft_path);
+            const int64_t draft_bytes = common_gguf_tensor_bytes(draft_path, params.speculative.draft.tensor_buft_overrides);
             if (draft_bytes > 0) {
                 params.expert_cache_external_reserve = draft_bytes;
                 COM_INF("%s: reserving %.2f GiB for the speculative draft model\n",
