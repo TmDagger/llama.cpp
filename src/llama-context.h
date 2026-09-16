@@ -293,6 +293,10 @@ private:
     // expert weight pools by original weight tensor, filled by init_expert_pools()
     llama_expert_pools expert_pools;
 
+    // free VRAM per backend before the pools were first sized; used to hold back only the
+    // part of the external (draft/MTP) reserve that other contexts have not consumed yet
+    std::vector<size_t> expert_pool_free_first;
+
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;

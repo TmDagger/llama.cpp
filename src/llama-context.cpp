@@ -704,7 +704,6 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
 
     // free VRAM per backend, used to spread the external reserve (draft/MTP contexts)
     std::vector<size_t> dev_free_all(backends.size(), 0);
-    size_t dev_free_sum = 0;
     for (size_t i = 0; i < backends.size(); ++i) {
         ggml_backend_dev_t d = ggml_backend_get_device(backends[i].get());
         if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -714,7 +713,20 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
         size_t tt = 0;
         ggml_backend_dev_memory(d, &fr, &tt);
         dev_free_all[i] = fr;
-        dev_free_sum += fr;
+    }
+
+    // first free VRAM seen for each device, before any external context (draft/MTP) took its
+    // share: the reserve is held back only for the part not consumed yet, so a re-reserve
+    // after the draft has loaded does not subtract it a second time
+    if (expert_pool_free_first.size() != backends.size()) {
+        expert_pool_free_first.assign(backends.size(), 0);
+    }
+    size_t dev_free_first_sum = 0;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        if (expert_pool_free_first[i] == 0) {
+            expert_pool_free_first[i] = dev_free_all[i];
+        }
+        dev_free_first_sum += expert_pool_free_first[i];
     }
 
     // The KV cache buffer is allocated up front in the memory module constructor on
@@ -740,11 +752,19 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
         // worst-case compute buffer measured before the pools were allocated; it must
         // stay free or graph_reserve fails after the pools have taken the VRAM
         const size_t compute = backend_id < (int) compute_reserve.size() ? compute_reserve[backend_id] : 0;
-        // hold back this device's share of the external reserve (draft/MTP), proportional
-        // to its free VRAM, so the target pools leave room for the other contexts
+        // hold back this device's share of the external reserve (draft/MTP), proportional to
+        // its first free VRAM, minus what other contexts have already consumed since: once
+        // the draft is loaded its bytes show up as consumed, so the reserve drops to 0 and
+        // is not subtracted a second time on a re-reserve
         size_t external = 0;
-        if (cparams.expert_cache_external_reserve > 0 && dev_free_sum > 0 && backend_id < (int) dev_free_all.size()) {
-            external = (size_t) ((double) cparams.expert_cache_external_reserve * (double) dev_free_all[backend_id] / (double) dev_free_sum);
+        size_t external_consumed = 0;
+        if (cparams.expert_cache_external_reserve > 0 && dev_free_first_sum > 0 &&
+                backend_id < (int) expert_pool_free_first.size()) {
+            const size_t configured = (size_t) ((double) cparams.expert_cache_external_reserve *
+                    (double) expert_pool_free_first[backend_id] / (double) dev_free_first_sum);
+            const size_t first = expert_pool_free_first[backend_id];
+            external_consumed = first > dev_free ? first - dev_free : 0;
+            external = configured > external_consumed ? configured - external_consumed : 0;
         }
         const size_t reserved = pool_rail + compute + external;
 
@@ -766,18 +786,19 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
 
             budget[backend_id] = (dev_free > kv_est + reserved) ? (dev_free - kv_est - reserved) : 0;
 
-            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB - max-context KV %.2f GiB - compute %.2f GiB - %.2f GiB rail - %.2f GiB external)\n",
+            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB - max-context KV %.2f GiB - compute %.2f GiB - %.2f GiB rail - %.2f GiB external, %.2f GiB already consumed)\n",
                     __func__, budget[backend_id] / 1024.0 / 1024.0 / 1024.0, ggml_backend_dev_name(dev),
                     dev_free / 1024.0 / 1024.0 / 1024.0, kv_est / 1024.0 / 1024.0 / 1024.0,
                     compute / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0,
-                    external / 1024.0 / 1024.0 / 1024.0);
+                    external / 1024.0 / 1024.0 / 1024.0, external_consumed / 1024.0 / 1024.0 / 1024.0);
         } else {
             budget[backend_id] = (dev_free > reserved) ? (dev_free - reserved) : 0;
 
-            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB incl. preallocated KV - compute %.2f GiB - %.2f GiB rail - %.2f GiB external)\n",
+            LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB on %s (free %.2f GiB incl. preallocated KV - compute %.2f GiB - %.2f GiB rail - %.2f GiB external, %.2f GiB already consumed)\n",
                     __func__, budget[backend_id] / 1024.0 / 1024.0 / 1024.0, ggml_backend_dev_name(dev),
                     dev_free / 1024.0 / 1024.0 / 1024.0, compute / 1024.0 / 1024.0 / 1024.0,
-                    pool_rail / 1024.0 / 1024.0 / 1024.0, external / 1024.0 / 1024.0 / 1024.0);
+                    pool_rail / 1024.0 / 1024.0 / 1024.0, external / 1024.0 / 1024.0 / 1024.0,
+                    external_consumed / 1024.0 / 1024.0 / 1024.0);
         }
 
         if (budget[backend_id] == 0) {
