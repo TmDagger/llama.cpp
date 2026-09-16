@@ -494,7 +494,6 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
     std::map<int, int>    expert_used;
     std::map<int, int>    dev_of;
 
-    double miss_sum = 0.0;
     int    n_layers = 0;
     int    max_layer = -1;
     uint64_t total_steps = 0;
@@ -516,7 +515,6 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
         n_expert[layer]  = l.prev.n_expert;
         expert_used[layer] = l.prev.n_expert_used;
         dev_of[layer]    = l.prev.backend_id;
-        miss_sum += miss_ps[layer];
         n_layers++;
         max_layer = std::max(max_layer, layer);
         total_steps = std::max(total_steps, l.steps);
@@ -544,16 +542,16 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 kv.first, copy_ps_dev, upd_ps_dev));
     }
 
-    // --mec-per-layer: scale each layer's slots by its miss rate, fitting the current
-    // total of every device separately (equalizing the hit/miss rate also evens out copy
-    // and upd; the clamps keep the suggestion inside the model's expert range)
-    const double mean_miss = miss_sum / n_layers;
-    if (mean_miss > 0.0) {
+    // --mec-per-layer: nudge every layer's slots by how far its hit rate deviates from the
+    // device average, divided by the layer's hit chance per slot (a slot buys less where the
+    // routing is already concentrated). The per-device total is preserved by scaling, and the
+    // clamps keep the suggestion inside the model's expert range.
+    {
         std::vector<int> sug(max_layer + 1, -1);
 
         std::map<int, std::vector<int>> by_dev;
         for (int layer = 0; layer <= max_layer; ++layer) {
-            if (miss_ps.find(layer) == miss_ps.end()) {
+            if (hit_pct.find(layer) == hit_pct.end()) {
                 continue;
             }
             by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
@@ -565,23 +563,35 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
                 continue;
             }
 
+            double avg_hit = 0.0;
             long   sum_cur = 0;
-            double sum_raw = 0.0;
-            std::vector<double> raw(ls.size(), 0.0);
+            for (int layer : ls) {
+                avg_hit += hit_pct[layer];
+                sum_cur += cur_slots[layer];
+            }
+            avg_hit /= (double) ls.size();
+
+            // preliminary budget: cur * avg / hit; a zero hit carries no information, keep cur
+            std::vector<double> pre(ls.size(), 0.0);
+            double sum_pre = 0.0;
             for (size_t i = 0; i < ls.size(); ++i) {
                 const int layer = ls[i];
-                raw[i] = (double) cur_slots[layer] * miss_ps[layer] / mean_miss;
-                sum_cur += cur_slots[layer];
-                sum_raw += raw[i];
+                const int ne   = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+                const int nmin = std::max(1, expert_used[layer]);
+                const double h = hit_pct[layer];
+                double v = h > 0.0 ? (double) cur_slots[layer] * avg_hit / h : (double) cur_slots[layer];
+                v = std::max((double) nmin, std::min(v, (double) ne));
+                pre[i] = v;
+                sum_pre += v;
             }
 
-            const double scale = sum_raw > 0.0 ? (double) sum_cur / sum_raw : 1.0;
+            const double scale = sum_pre > 0.0 ? (double) sum_cur / sum_pre : 1.0;
             long sum_sug = 0;
             for (size_t i = 0; i < ls.size(); ++i) {
                 const int layer = ls[i];
                 const int ne   = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
                 const int nmin = std::max(1, expert_used[layer]);
-                int val = (int) std::lround(raw[i] * scale);
+                int val = (int) std::lround(pre[i] * scale);
                 val = std::max(nmin, std::min(val, ne));
                 sug[layer] = val;
                 sum_sug += val;
@@ -608,24 +618,90 @@ static std::vector<std::string> moe_telem_summary(llama_context * ctx, const moe
         out.push_back(string_format("moe recommend: --mec-per-layer %s", list.c_str()));
     }
 
-    // --mec-whole: layers whose cache barely beats the random baseline
+    // --mec-whole vs cache suppression for uniformly routed layers: a layer whose hit rate
+    // barely beats the random baseline gets little from the LRU cache. Pinning it whole (all
+    // n_expert slots) can starve the remaining layers, so when that drop is too large
+    // recommend running those layers on the host path instead (--mec-per-layer 0): their
+    // slots go to the layers where the cache does help. On multi-GPU the host path is often
+    // the better trade, as DDR bandwidth can exceed an already saturated PCIe link.
     {
-        std::string list;
+        std::map<int, std::vector<int>> by_dev;
         for (int layer = 0; layer <= max_layer; ++layer) {
-            auto it = hit_pct.find(layer);
-            if (it == hit_pct.end() || n_expert[layer] <= 0 || cur_slots[layer] <= 0 || cur_slots[layer] == n_expert[layer]) {
+            if (hit_pct.find(layer) == hit_pct.end()) {
                 continue;
             }
-            const double base = 100.0*(double) cur_slots[layer] / (double) n_expert[layer];
-            if (it->second < 1.5*base) {
+            by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
+        }
+
+        std::vector<int> off_layers;
+        std::string      whole_list;
+        double           msg_avg_whole = 0.0;
+        double           msg_avg_off   = 0.0;
+        bool             msg_set       = false;
+
+        for (const auto & kv : by_dev) {
+            const std::vector<int> & ls = kv.second;
+            if (ls.empty()) {
+                continue;
+            }
+
+            std::vector<int> uni;
+            long   sum_cur     = 0;
+            double whole_slots = 0.0;
+            for (int layer : ls) {
+                sum_cur += cur_slots[layer];
+                if (n_expert[layer] <= 0 || cur_slots[layer] <= 0 || cur_slots[layer] == n_expert[layer]) {
+                    continue;
+                }
+                const double base = 100.0*(double) cur_slots[layer] / (double) n_expert[layer];
+                if (hit_pct[layer] < 1.5*base) {
+                    uni.push_back(layer);
+                    whole_slots += n_expert[layer];
+                }
+            }
+            if (uni.empty()) {
+                continue;
+            }
+
+            const int n_rem = (int) ls.size() - (int) uni.size();
+            if (n_rem > 0) {
+                const double avg_off   = (double) sum_cur / (double) n_rem;
+                const double avg_whole = std::max(0.0, (double) sum_cur - whole_slots) / (double) n_rem;
+                if (avg_whole < 0.8*avg_off) {
+                    off_layers.insert(off_layers.end(), uni.begin(), uni.end());
+                    if (!msg_set) {
+                        msg_avg_whole = avg_whole;
+                        msg_avg_off   = avg_off;
+                        msg_set       = true;
+                    }
+                    continue;
+                }
+            }
+            for (int layer : uni) {
+                if (!whole_list.empty()) {
+                    whole_list += ",";
+                }
+                whole_list += std::to_string(layer);
+            }
+        }
+
+        if (!off_layers.empty()) {
+            std::string list;
+            for (int layer = 0; layer <= max_layer; ++layer) {
                 if (!list.empty()) {
                     list += ",";
                 }
-                list += std::to_string(layer);
+                if (std::find(off_layers.begin(), off_layers.end(), layer) != off_layers.end()) {
+                    list += "0";
+                } else {
+                    list += "a";
+                }
             }
+            out.push_back(string_format("moe recommend: --mec-per-layer %s (uniform layers -> host path; pinning them whole would leave ~%.0f slots/layer vs ~%.0f without)",
+                    list.c_str(), msg_avg_whole, msg_avg_off));
         }
-        if (!list.empty()) {
-            out.push_back(string_format("moe recommend: --mec-whole %s", list.c_str()));
+        if (!whole_list.empty()) {
+            out.push_back(string_format("moe recommend: --mec-whole %s", whole_list.c_str()));
         }
     }
 

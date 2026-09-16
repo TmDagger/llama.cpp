@@ -22,6 +22,10 @@ cached in VRAM).
   copied bytes and pool update time, plus printed recommendations.
 - Fixes: hit/miss was counted twice per compute (remap GET_ROWS plus pooled
   MUL_MAT_ID); the `slots` split read one element past the end of its vectors.
+- Expert pool hardening (ported from the `moe-expert-pool` branch): the map table is now
+  pool-owned on the device (stable pointer, no dependency on the scheduler split input
+  copy path), the remap aborts loudly if its pool was not updated, the expert-tensor
+  collector is unbounded, and the hot path keeps a single queue sync per ubatch.
 
 ## 2. Launch parameters
 
@@ -121,11 +125,16 @@ moe recommend: --ts 0.283,0.717 (equalize copy, ...)
 moe recommend: --ts 0.335,0.665 (equalize upd ...)
 ```
 
-- `--mec-per-layer`: scales each layer's slots by its miss rate, normalized per device
-  so the total slots per card are unchanged; clamped to
-  `[n_expert_used, n_expert]`; the residual goes to the first layer of the device.
-- `--mec-whole`: layers whose hit rate barely beats the random baseline
-  `n_slots / n_expert` (LRU does not help them).
+- `--mec-per-layer`: nudges each layer's slots by how far its hit rate deviates from the
+  device average, divided by the layer's hit chance per slot (`pre = cur * avg / hit`),
+  so a slot is worth more where the routing is concentrated. The device total is
+  preserved by scaling, clamped to `[n_expert_used, n_expert]`; the residual goes to the
+  first layer of the device.
+- `--mec-whole` or host path: layers whose hit rate barely beats the random baseline
+  `n_slots / n_expert` (LRU does not help them). When pinning them whole would starve
+  the remaining layers (`avg_whole < 0.8 * avg_off`), the recommendation switches to
+  `--mec-per-layer 0,...` instead: those layers run the stock host path and their slots
+  go to the layers where the cache does help.
 - `--ts`: two variants, one balancing copied bytes and one balancing updater time per
   device. Both assume you optimize the slots first and then move towards the target in
   steps, watching for PCIe saturation.
@@ -161,12 +170,23 @@ copies. The later layers concentrate on a small hot set: hit rates of 85-98% wit
 same slot count are normal. Per-device `copy` and `upd` can differ by 2-3x when the
 split puts the "hard" layers on one card.
 
+On a multi-GPU box, moving the uniform layers to the host path is usually the better
+trade. Pinning them whole spends a full `n_expert` slots per layer, which the useful
+layers pay for with a lower hit rate; running them on the CPU frees those slots, and the
+DDR path is often wider than an already saturated PCIe link (a single PCIe 5.0 x16 card
+was measured at ~22-24 GB/s, while part of the traffic also goes to the second card on
+PCIe 4.0 x4). For DeepSeek-V4-Flash, sending the 3 uniform layers to the CPU with
+`--mec-per-layer 0,0,0` and giving their slots to the rest measured 11.47 t/s against
+10.03 t/s for `--mec-whole 0-2`. On a single card the difference is smaller.
+
 ### 4.3 Tuning scenario
 
 1. Start without knobs: `-mec 128`, auto split (`slots`).
 2. Run with `GGML_MOE_POOL_STATS=1` and read the per-generation summary.
-3. For layers near the baseline, pin them whole: `--mec-whole 0-2`. This removes their
-   stalls and moves the cache budget to the layers where it helps.
+3. For layers near the baseline, decide whole vs host path from the suggestion: pin them
+   whole with `--mec-whole 0-2`, or, when the summary warns that whole pinning would
+   starve the other layers, send them to the host path with `--mec-per-layer 0,0,0`.
+   Both move the cache budget to the layers where it helps.
 4. Re-run and apply the suggested `--mec-per-layer` (it keeps each card's slot total
    unchanged). Compare `copy`/`upd` and t/s.
 5. Only then look at `--ts`: pick a `-ts` suggestion (copy or upd), set
