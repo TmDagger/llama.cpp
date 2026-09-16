@@ -2526,6 +2526,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.expert_cache_per_layer.clear();
     result.split_by_cache_slots           = false;
     result.expert_cache_external_reserve  = 0;
+    result.expert_cache_external_reserve_dev = -1;
+    result.draft_reserve_bytes            = 0;
 
     return result;
 }

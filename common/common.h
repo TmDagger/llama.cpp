@@ -490,6 +490,8 @@ struct common_params {
     std::vector<int32_t> expert_cache_whole_layers; // explicit layers to keep fully resident
     std::vector<int32_t> expert_cache_per_layer;    // per-layer slot counts (-1 = dynamic, empty = all dynamic)
     int64_t expert_cache_external_reserve = 0;      // VRAM (bytes) reserved for other contexts (e.g. draft/MTP), distributed across devices
+    int32_t expert_cache_external_reserve_dev = -1; // device index to hold the whole reserve on; -1 = spread
+    int64_t draft_reserve_bytes = 0;                // bytes kept free on the last device when distributing layers (draft pinned there)
     float   moe_pool_pcie_bw = 0.0f;        // PCIe BW (GB/s) for the h* break-even estimate (0 = unset)
     float   moe_pool_ram_bw = 0.0f;         // RAM BW (GB/s) for the h* break-even estimate (0 = unset)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs

@@ -333,6 +333,11 @@ extern "C" {
         // slots (split_by_cache_slots), size: llama_max_devices(); may be NULL
         const int32_t * expert_cache_rail_mb;
 
+        // bytes kept free on the last device when distributing layers, so that a draft model
+        // pinned there (e.g. DSpark, which reads the last hidden state and shares lm_head)
+        // has room; 0 = no reserve
+        int64_t draft_reserve_bytes;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.
@@ -385,6 +390,7 @@ extern "C" {
         const int32_t * expert_cache_per_layer; // per-layer slot counts, -1 = dynamic; null = all dynamic [EXPERIMENTAL]
         int32_t  n_expert_cache_per_layer;      // number of entries in expert_cache_per_layer [EXPERIMENTAL]
         int64_t  expert_cache_external_reserve; // VRAM (bytes) held back for other contexts, spread across devices [EXPERIMENTAL]
+        int32_t  expert_cache_external_reserve_dev; // device index to hold the whole external reserve on; -1 = spread [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

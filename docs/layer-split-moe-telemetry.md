@@ -41,6 +41,13 @@ cached in VRAM).
   - `manual`: use `-ts`.
   - Setting `-ts` selects `manual` automatically.
 - `--vram-bw GB0,GB1,...`: manual VRAM bandwidth for `bw` (skips the benchmark).
+- DSpark draft placement: when the speculative type is `draft-dspark` and `-devd` is not
+  given, the draft is pinned to the last device (it reads the target's last hidden state
+  and shares `lm_head`, both of which live there), and the layer split reserves the
+  draft's bytes on that device: `slots` subtracts them from the last device's capacity,
+  `bw`/`eq` scale its share down proportionally. The external reserve is also held on that
+  device instead of being spread. The draft still fits if the reserve is spread, but the
+  last device's expert cache would be starved.
 
 ### 2.2 Expert cache
 

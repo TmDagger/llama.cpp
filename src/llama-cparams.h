@@ -41,6 +41,8 @@ struct llama_cparams {
     std::vector<int32_t> expert_cache_per_layer;
     // VRAM (bytes) held back for other contexts (draft/MTP), spread across devices
     size_t expert_cache_external_reserve = 0;
+    // device index to hold the whole external reserve on; -1 = spread across devices
+    int32_t expert_cache_external_reserve_dev = -1;
 
     float rope_freq_base;
     float rope_freq_scale;

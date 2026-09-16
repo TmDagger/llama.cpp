@@ -296,6 +296,7 @@ llama_context::llama_context(
                 params.expert_cache_per_layer + params.n_expert_cache_per_layer);
     }
     cparams.expert_cache_external_reserve = (size_t) std::max<int64_t>(0, params.expert_cache_external_reserve);
+    cparams.expert_cache_external_reserve_dev = params.expert_cache_external_reserve_dev;
     cparams.expert_cache_rail_mb.assign(llama_max_devices(), 768);
     if (params.expert_cache_rail_mb != nullptr) {
         for (size_t i = 0; i < llama_max_devices(); ++i) {
@@ -758,10 +759,17 @@ void llama_context::init_expert_pools(const std::vector<size_t> & compute_reserv
         // is not subtracted a second time on a re-reserve
         size_t external = 0;
         size_t external_consumed = 0;
-        if (cparams.expert_cache_external_reserve > 0 && dev_free_first_sum > 0 &&
-                backend_id < (int) expert_pool_free_first.size()) {
-            const size_t configured = (size_t) ((double) cparams.expert_cache_external_reserve *
-                    (double) expert_pool_free_first[backend_id] / (double) dev_free_first_sum);
+        if (cparams.expert_cache_external_reserve > 0 && backend_id < (int) expert_pool_free_first.size()) {
+            size_t configured = 0;
+            if (cparams.expert_cache_external_reserve_dev >= 0) {
+                // hold the whole reserve on the device where the draft is loaded, so the
+                // other devices keep their full pool budget
+                configured = backend_id == cparams.expert_cache_external_reserve_dev
+                        ? cparams.expert_cache_external_reserve : 0;
+            } else if (dev_free_first_sum > 0) {
+                configured = (size_t) ((double) cparams.expert_cache_external_reserve *
+                        (double) expert_pool_free_first[backend_id] / (double) dev_free_first_sum);
+            }
             const size_t first = expert_pool_free_first[backend_id];
             external_consumed = first > dev_free ? first - dev_free : 0;
             external = configured > external_consumed ? configured - external_consumed : 0;
@@ -4166,6 +4174,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache_per_layer      =*/ nullptr,
         /*.n_expert_cache_per_layer    =*/ 0,
         /*.expert_cache_external_reserve =*/ 0,
+        /*.expert_cache_external_reserve_dev =*/ -1,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

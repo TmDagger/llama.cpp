@@ -1315,10 +1315,9 @@ static int64_t common_gguf_tensor_bytes(const std::string & path) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    common_params_apply_layer_split_strategy(params);
-
     // hold back VRAM for an external speculative draft: its weights are loaded after the
-    // target context, so the target expert cache must not consume all the free VRAM
+    // target context, so the target expert cache must not consume all the free VRAM. this
+    // runs before the layer split so the split can also leave room on the draft's device.
     if (params.speculative.has_dft()) {
         const std::string & draft_path = params.speculative.draft.mparams.path;
         if (!draft_path.empty()) {
@@ -1327,9 +1326,27 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.expert_cache_external_reserve = draft_bytes;
                 COM_INF("%s: reserving %.2f GiB for the speculative draft model\n",
                         __func__, draft_bytes / 1024.0 / 1024.0 / 1024.0);
+
+                // DSpark reads the target's last hidden state and (in vLLM) shares its
+                // lm_head, both on the last device: pin the draft there and reserve its
+                // bytes on that device, so the layer split leaves room for it
+                const bool is_dspark = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                        COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+                if (is_dspark && params.speculative.draft.devices.empty()) {
+                    const std::vector<ggml_backend_dev_t> devs = common_params_offload_devices(params);
+                    if (!devs.empty()) {
+                        params.speculative.draft.devices = { devs.back(), nullptr };
+                        params.expert_cache_external_reserve_dev = (int32_t) (devs.size() - 1);
+                        params.draft_reserve_bytes = draft_bytes;
+                        COM_INF("%s: DSpark draft pinned to the last device (%s)\n",
+                                __func__, ggml_backend_dev_name(devs.back()));
+                    }
+                }
             }
         }
     }
+
+    common_params_apply_layer_split_strategy(params);
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1896,6 +1913,31 @@ void common_params_apply_layer_split_strategy(common_params & params) {
         }
     }
 
+    // a draft pinned to the last device (DSpark) needs room there: shrink that device's
+    // share by the fraction of its layer capacity left after the draft
+    if (params.draft_reserve_bytes > 0 && !shares.empty()) {
+        const size_t i = shares.size() - 1;
+        ggml_backend_dev_t dev = devs[i];
+        size_t free_b = 0;
+        size_t total_b = 0;
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+        if (free_b == 0 && total_b == 0) {
+            ggml_backend_dev_memory(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), &free_b, &total_b);
+        }
+        size_t rail_b = 512ull * 1024 * 1024;
+        if (i < params.expert_cache_rail_mb.size() && params.expert_cache_rail_mb[i] > 0) {
+            rail_b = (size_t) params.expert_cache_rail_mb[i] * 1024 * 1024;
+        }
+        const double cap = (double) free_b - (double) rail_b;
+        if (cap > 0.0) {
+            const double keep = std::max(0.0, (cap - (double) params.draft_reserve_bytes) / cap);
+            shares[i] *= (float) keep;
+            COM_INF("%s: reserving %.2f GiB on %s for the draft: layer share %.3f -> %.3f\n",
+                    __func__, params.draft_reserve_bytes / 1024.0/1024.0/1024.0,
+                    ggml_backend_dev_name(dev), keep > 0.0 ? shares[i]/keep : 0.0, shares[i]);
+        }
+    }
+
     std::fill(params.tensor_split, params.tensor_split + llama_max_devices(), 0.0f);
     for (size_t i = 0; i < shares.size() && i < llama_max_devices(); ++i) {
         params.tensor_split[i] = shares[i];
@@ -1916,6 +1958,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.expert_cache_rail_mb = params.expert_cache_rail_mb.data();
+    mparams.draft_reserve_bytes = params.draft_reserve_bytes;
     mparams.split_by_cache_slots = params.split_by_cache_slots;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1986,6 +2029,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_per_layer = params.expert_cache_per_layer.empty() ? nullptr : params.expert_cache_per_layer.data();
     cparams.n_expert_cache_per_layer = (int32_t) params.expert_cache_per_layer.size();
     cparams.expert_cache_external_reserve = (int64_t) params.expert_cache_external_reserve;
+    cparams.expert_cache_external_reserve_dev = params.expert_cache_external_reserve_dev;
     cparams.expert_cache_rail_mb = params.expert_cache_rail_mb.empty() ? nullptr : params.expert_cache_rail_mb.data();
     cparams.expert_cache_legacy_kv_estimate = params.expert_cache_legacy_kv_estimate;
 

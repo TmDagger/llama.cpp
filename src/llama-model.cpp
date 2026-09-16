@@ -1525,7 +1525,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         if (params.expert_cache_rail_mb && params.expert_cache_rail_mb[i] > 0) {
                             rail = (size_t) params.expert_cache_rail_mb[i] * 1024 * 1024;
                         }
-                        const double avail = (double) free - (double) rail;
+                        double avail = (double) free - (double) rail;
+                        // keep room on the last device for a draft pinned there (e.g. DSpark,
+                        // which reads the last hidden state and shares lm_head)
+                        if (i + 1 == n_devices() && params.draft_reserve_bytes > 0) {
+                            avail -= (double) params.draft_reserve_bytes;
+                        }
                         splits[i] = avail > 0.0 ? (float) (avail / (dense_avg + esz_slot * s)) : 0.0f;
                     }
                 };
@@ -2870,6 +2875,7 @@ llama_model_params llama_model_default_params() {
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.expert_cache_rail_mb        =*/ nullptr,
+        /*.draft_reserve_bytes         =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
