@@ -50,6 +50,11 @@ cached in VRAM).
   (`-cmoed` / `-ncmoed`): experts kept on the CPU do not count against the reserve, which
   keeps the target expert cache on that device nearly intact. The draft still fits if the
   reserve is spread, but the last device's expert cache would be starved.
+- DSpark MoE draft cache: when the target has `-mec > 0` and the user did not set
+  `-cmoed` / `-ncmoed`, a MoE DSpark draft gets the target's treatment too: its experts go
+  to the CPU and the hot ones are cached on the GPU (`--spec-draft-mec` overrides the
+  level, the default inherits `-mec`). The reserve then covers the draft's dense tensors
+  plus its cache slots, not the whole GGUF.
 
 ### 2.2 Expert cache
 

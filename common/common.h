@@ -347,6 +347,11 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // expert cache for the draft model: -1 = inherit the target -mec, 0 = off, >0 = explicit
+    int32_t expert_cache_slots = -1;
+    // true when -cmoed/-ncmoed was given: the user controls the draft MoE offload
+    bool cpu_moe_set = false;
 };
 
 struct common_params_speculative_ngram_mod {

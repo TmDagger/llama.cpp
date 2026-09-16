@@ -4376,6 +4376,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
         [](common_params & params) {
             params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            params.speculative.draft.cpu_moe_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
@@ -4386,8 +4387,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
+            params.speculative.draft.cpu_moe_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--spec-draft-mec", "--spec-draft-moe-expert-cache"}, "N",
+        "keep a cache of N experts per offloaded MoE weight tensor in VRAM for the draft model\n"
+        "(default: inherit the target -mec; 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.expert_cache_slots = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MEC"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",

@@ -1290,10 +1290,21 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-// sum of the tensor bytes that will live on the GPU: tensors matched by a CPU tensor
-// override are excluded, so the reserve follows -cmoed/-ncmoed. partial offload via
-// n_gpu_layers is not accounted for (the draft is normally loaded with all layers offloaded)
-static int64_t common_gguf_tensor_bytes(const std::string & path, const std::vector<llama_model_tensor_buft_override> & overrides) {
+struct common_draft_footprint {
+    int64_t dense     = 0; // non-expert tensors that stay on the GPU
+    int64_t exps_gpu  = 0; // expert tensors that stay on the GPU (not overridden to the CPU)
+    int64_t exps_slot = 0; // sum of one expert slot per expert tensor (multiply by n_slots)
+    bool    is_moe    = false;
+};
+
+// GPU bytes a draft model will occupy: non-expert tensors not overridden to the CPU, plus
+// the expert tensors (either fully on the GPU, or as cache slots when the experts are kept
+// on the CPU). partial offload via n_gpu_layers is not accounted for (the draft is normally
+// loaded with all layers offloaded)
+static common_draft_footprint common_gguf_draft_footprint(const std::string & path,
+        const std::vector<llama_model_tensor_buft_override> & overrides) {
+    common_draft_footprint res;
+
     struct ggml_context * ctx = nullptr;
     struct gguf_init_params gp = {
         /*.no_alloc = */ true,
@@ -1301,11 +1312,14 @@ static int64_t common_gguf_tensor_bytes(const std::string & path, const std::vec
     };
     struct gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (g == nullptr) {
-        return 0;
+        return res;
     }
 
-    int64_t total = 0;
+    const std::regex re_exps(LLM_FFN_EXPS_REGEX);
+
     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        const std::string name = t->name;
+
         bool on_cpu = false;
         for (const auto & ov : overrides) {
             if (ov.pattern == nullptr) {
@@ -1314,22 +1328,30 @@ static int64_t common_gguf_tensor_bytes(const std::string & path, const std::vec
             if (ov.buft != ggml_backend_cpu_buffer_type()) {
                 continue;
             }
-            if (std::regex_search(std::string(t->name), std::regex(ov.pattern))) {
+            if (std::regex_search(name, std::regex(ov.pattern))) {
                 on_cpu = true;
                 break;
             }
         }
-        if (on_cpu) {
+
+        if (std::regex_search(name, re_exps)) {
+            res.is_moe = true;
+            res.exps_slot += (int64_t) t->nb[2];
+            if (!on_cpu) {
+                res.exps_gpu += (int64_t) ggml_nbytes(t);
+            }
             continue;
         }
-        total += (int64_t) ggml_nbytes(t);
+        if (!on_cpu) {
+            res.dense += (int64_t) ggml_nbytes(t);
+        }
     }
 
     gguf_free(g);
     if (ctx != nullptr) {
         ggml_free(ctx);
     }
-    return total;
+    return res;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1340,7 +1362,47 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.speculative.has_dft()) {
         const std::string & draft_path = params.speculative.draft.mparams.path;
         if (!draft_path.empty()) {
-            const int64_t draft_bytes = common_gguf_tensor_bytes(draft_path, params.speculative.draft.tensor_buft_overrides);
+            const bool is_dspark = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+
+            const common_draft_footprint fp = common_gguf_draft_footprint(
+                    draft_path, params.speculative.draft.tensor_buft_overrides);
+
+            // a DSpark MoE draft gets the target's expert cache too: its experts go to the
+            // CPU and the hot ones are cached on the GPU. -cmoed/-ncmoed keep the user in
+            // control of the draft experts, so the auto path stays out of the way then
+            int32_t draft_slots = params.speculative.draft.expert_cache_slots;
+            if (draft_slots < 0) {
+                draft_slots = params.expert_cache_slots;
+            }
+            bool exps_overridden = false;
+            for (const auto & ov : params.speculative.draft.tensor_buft_overrides) {
+                if (ov.pattern == nullptr) {
+                    break;
+                }
+                if (ov.pattern == LLM_FFN_EXPS_REGEX) {
+                    exps_overridden = true;
+                    break;
+                }
+            }
+            const bool enable_draft_cache = is_dspark && fp.is_moe && !params.speculative.draft.cpu_moe_set &&
+                    !exps_overridden && draft_slots > 0;
+
+            int64_t draft_bytes = fp.dense + fp.exps_gpu;
+            if (enable_draft_cache) {
+                // keep the null terminator last
+                if (!params.speculative.draft.tensor_buft_overrides.empty() &&
+                        params.speculative.draft.tensor_buft_overrides.back().pattern == nullptr) {
+                    params.speculative.draft.tensor_buft_overrides.pop_back();
+                }
+                params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+                params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr});
+                params.speculative.draft.expert_cache_slots = draft_slots;
+                draft_bytes = fp.dense + (int64_t) draft_slots * fp.exps_slot;
+                COM_INF("%s: DSpark MoE draft: experts on the CPU, %d cache slots on the GPU\n",
+                        __func__, draft_slots);
+            }
+
             if (draft_bytes > 0) {
                 params.expert_cache_external_reserve = draft_bytes;
                 COM_INF("%s: reserving %.2f GiB for the speculative draft model\n",
@@ -1349,8 +1411,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 // DSpark reads the target's last hidden state and (in vLLM) shares its
                 // lm_head, both on the last device: pin the draft there and reserve its
                 // bytes on that device, so the layer split leaves room for it
-                const bool is_dspark = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-                        COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
                 if (is_dspark && params.speculative.draft.devices.empty()) {
                     const std::vector<ggml_backend_dev_t> devs = common_params_offload_devices(params);
                     if (!devs.empty()) {

@@ -2517,10 +2517,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    // the draft/MTP context does not own the expert cache: a second set of pools would
-    // waste VRAM, and the target pools are sized before the draft model is loaded
-    result.expert_cache_slots             = 0;
+    // the draft may run its own expert cache (DSpark MoE, enabled by common_init_result);
+    // the per-layer and whole-layer knobs still belong to the target only
+    result.expert_cache_slots             = params_spec.expert_cache_slots > 0 ? params_spec.expert_cache_slots : 0;
     result.expert_cache_slots_per_dev.clear();
+    result.expert_cache_slots_down        = 0;
+    result.expert_cache_slots_gate_up     = 0;
     result.expert_cache_whole_count       = 0;
     result.expert_cache_whole_layers.clear();
     result.expert_cache_per_layer.clear();
