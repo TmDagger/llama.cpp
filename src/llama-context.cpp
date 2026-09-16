@@ -714,6 +714,11 @@ void llama_context::init_expert_pools() {
     if (n_pooled > 0) {
         LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors (%d skipped by the VRAM rail - those layers run the stock host-copy path)\n",
                 __func__, n_pooled, n_skipped);
+    } else if (n_skipped > 0) {
+        // every candidate was found but the budget rejected them all - saying "no
+        // offloaded tensors found" here sent the last reporter chasing a ghost
+        LLAMA_LOG_WARN("%s: expert cache had no effect: 0 of %d offloaded MoE expert weight tensors fit the VRAM budget - all layers run the stock host-copy path\n",
+                __func__, n_skipped);
     } else {
         LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
     }
