@@ -41,15 +41,16 @@ cached in VRAM).
   - `manual`: use `-ts`.
   - Setting `-ts` selects `manual` automatically.
 - `--vram-bw GB0,GB1,...`: manual VRAM bandwidth for `bw` (skips the benchmark).
-- DSpark draft placement: when the speculative type is `draft-dspark` and `-devd` is not
-  given, the draft is pinned to the last device (it reads the target's last hidden state
-  and shares `lm_head`, both of which live there), and the layer split reserves the
-  draft's bytes on that device: `slots` subtracts them from the last device's capacity,
-  `bw`/`eq` scale its share down proportionally. The external reserve is also held on that
-  device instead of being spread. The reserve follows the draft's CPU tensor overrides
-  (`-cmoed` / `-ncmoed`): experts kept on the CPU do not count against the reserve, which
-  keeps the target expert cache on that device nearly intact. The draft still fits if the
-  reserve is spread, but the last device's expert cache would be starved.
+- Tail draft placement (DSpark, MTP): when the speculative type attaches to the target's
+  last hidden state and `-devd` is not given, the draft is pinned to the last device (it
+  reads that hidden state, and DSpark also shares `lm_head`, both of which live there), and
+  the layer split reserves the draft's bytes on that device: `slots` subtracts them from
+  the last device's capacity, `bw`/`eq` scale its share down proportionally. The external
+  reserve is also held on that device instead of being spread. The reserve follows the
+  draft's CPU tensor overrides (`-cmoed` / `-ncmoed`): experts kept on the CPU do not count
+  against the reserve, which keeps the target expert cache on that device nearly intact.
+  The draft still fits if the reserve is spread, but the last device's expert cache would
+  be starved. EAGLE-3 and DFlash attach to several spread layers and stay spread - see 5.4.
 - DSpark MoE draft cache: when the target has `-mec > 0` and the user did not set
   `-cmoed` / `-ncmoed`, a MoE DSpark draft gets the target's treatment too: its experts go
   to the CPU and the hot ones are cached on the GPU (`--spec-draft-mec` overrides the
@@ -223,11 +224,11 @@ On a single card the difference is smaller.
 The draft model is a separate context loaded after the target. Two things matter: where it
 lands, and how much VRAM it takes from the target cache.
 
-### 5.1 DSpark on the last device
+### 5.1 Tail drafts on the last device
 
-DSpark reads the target's last hidden state and shares its `lm_head`, both of which live on
-the last device under layer split (`get_layer_buft_list(n_layer_all)`). With
-`--spec-draft-model` and no `-devd`, the draft is pinned to the last offload device, the
+DSpark and MTP read the target's last hidden state (DSpark also shares its `lm_head`),
+which lives on the last device under layer split (`get_layer_buft_list(n_layer_all)`). With
+`--spec-draft-model` and no `-devd`, a tail draft is pinned to the last offload device, the
 whole external reserve is held on that device instead of being spread, and the layer split
 reserves the draft's bytes there (`slots` subtracts them from the last device's capacity,
 `bw`/`eq` scale its share down). The last device therefore gets fewer target layers, so its
@@ -254,12 +255,25 @@ matters more and pure CPU experts for the draft (`--spec-draft-mec 0`) was the b
 setting. The auto path is a starting point; measure `copy`/`upd` and t/s with and without
 `--spec-draft-mec`.
 
-### 5.4 Other draft types
+### 5.4 Attachment and placement
 
-The auto placement is DSpark-only for now. EAGLE-3 exposes its attachment in the metadata
-(`eagle3.target_layers`, e.g. `[2, 12, 21]` for gpt-oss-20b) and has a 1-layer draft, so
-its hidden states come from early/mid layers, likely on the first device - it needs its own
-placement rule. DFlash and MTP are not handled yet.
+The draft GGUF carries its attachment in `<arch>.target_layers` (read before the model is
+loaded, next to the footprint). The placement follows it:
+
+| draft type | attachment | placement | reserve |
+| --- | --- | --- | --- |
+| DSpark | last hidden state, shared `lm_head` | last device | held on the last device |
+| MTP | last hidden state / nextn | last device | held on the last device |
+| EAGLE-3 | `target_layers` (3), e.g. `[2, 12, 21]` | spread over the offload devices | spread |
+| DFlash | `target_layers` (5), spread | spread over the offload devices | spread |
+
+DFlash examples: `[6, 20, 34, 48, 62]` (Qwen3.8 27B), `[1, 17, 29, 47, 58]` (Gemma4 31B).
+
+EAGLE-3 and DFlash read hidden states from several layers spread over the model, so no
+single device owns them. Those hidden states are copied to host buffers anyway
+(`llama_context::extract_layer_inputs`), so pinning the draft would not save any traffic,
+it would only move the reserve. They stay spread, like the target. An explicit `-devd`
+still wins for any type.
 
 ## 6. Limitations and caveats
 
@@ -285,7 +299,6 @@ placement rule. DFlash and MTP are not handled yet.
   shift. The logical split avoids reallocation, so it is feasible; the burst logging is
   the first step.
 - Session-wide telemetry aggregation (separate toggle).
-- Draft placement for EAGLE-3 (reads `eagle3.target_layers`, early/mid layers), DFlash and
-  MTP; the current auto rule is DSpark-only.
+- Draft expert cache for EAGLE-3/DFlash/MTP (only the DSpark MoE draft has one today).
 - Draft cache tuning: pick the draft cache level from the measured trade-off (or make the
   auto path opt-in) instead of always inheriting `-mec`.

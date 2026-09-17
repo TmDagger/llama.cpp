@@ -1295,6 +1295,9 @@ struct common_draft_footprint {
     int64_t exps_gpu  = 0; // expert tensors that stay on the GPU (not overridden to the CPU)
     int64_t exps_slot = 0; // sum of one expert slot per expert tensor (multiply by n_slots)
     bool    is_moe    = false;
+
+    std::string          arch;          // general.architecture
+    std::vector<int32_t> target_layers; // <arch>.target_layers, empty when absent
 };
 
 // GPU bytes a draft model will occupy: non-expert tensors not overridden to the CPU, plus
@@ -1316,6 +1319,18 @@ static common_draft_footprint common_gguf_draft_footprint(const std::string & pa
     }
 
     const std::regex re_exps(LLM_FFN_EXPS_REGEX);
+
+    const int64_t arch_id = gguf_find_key(g, "general.architecture");
+    if (arch_id >= 0 && gguf_get_kv_type(g, arch_id) == GGUF_TYPE_STRING) {
+        res.arch = gguf_get_val_str(g, arch_id);
+
+        const int64_t tl_id = gguf_find_key(g, (res.arch + ".target_layers").c_str());
+        if (tl_id >= 0 && gguf_get_kv_type(g, tl_id) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(g, tl_id) == GGUF_TYPE_INT32) {
+            const int32_t * data = (const int32_t *) gguf_get_arr_data(g, tl_id);
+            res.target_layers.assign(data, data + gguf_get_arr_n(g, tl_id));
+        }
+    }
 
     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         const std::string name = t->name;
@@ -1362,11 +1377,27 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.speculative.has_dft()) {
         const std::string & draft_path = params.speculative.draft.mparams.path;
         if (!draft_path.empty()) {
-            const bool is_dspark = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-                    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+            const auto & types = params.speculative.types;
+            const bool is_dspark = std::find(types.begin(), types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+            // DSpark and MTP read the target's last hidden state (DSpark also shares its
+            // lm_head): they attach to the tail, so they belong on the last device.
+            // EAGLE-3 and DFlash read hidden states from several layers spread over the
+            // model, so no single device owns them and they stay spread.
+            const bool attach_tail = is_dspark ||
+                    std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
 
             const common_draft_footprint fp = common_gguf_draft_footprint(
                     draft_path, params.speculative.draft.tensor_buft_overrides);
+
+            if (!fp.target_layers.empty()) {
+                std::string layers;
+                for (size_t i = 0; i < fp.target_layers.size(); ++i) {
+                    layers += (i > 0 ? ", " : "") + std::to_string(fp.target_layers[i]);
+                }
+                COM_INF("%s: draft '%s' attaches to target layers [%s]\n",
+                        __func__, fp.arch.c_str(), layers.c_str());
+            }
 
             // a DSpark MoE draft gets the target's expert cache too: its experts go to the
             // CPU and the hot ones are cached on the GPU. -cmoed/-ncmoed keep the user in
@@ -1408,17 +1439,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 COM_INF("%s: reserving %.2f GiB for the speculative draft model\n",
                         __func__, draft_bytes / 1024.0 / 1024.0 / 1024.0);
 
-                // DSpark reads the target's last hidden state and (in vLLM) shares its
-                // lm_head, both on the last device: pin the draft there and reserve its
-                // bytes on that device, so the layer split leaves room for it
-                if (is_dspark && params.speculative.draft.devices.empty()) {
-                    const std::vector<ggml_backend_dev_t> devs = common_params_offload_devices(params);
-                    if (!devs.empty()) {
-                        params.speculative.draft.devices = { devs.back(), nullptr };
-                        params.expert_cache_external_reserve_dev = (int32_t) (devs.size() - 1);
-                        params.draft_reserve_bytes = draft_bytes;
-                        COM_INF("%s: DSpark draft pinned to the last device (%s)\n",
-                                __func__, ggml_backend_dev_name(devs.back()));
+                // a tail draft reads the target's last hidden state (and DSpark shares
+                // its lm_head), both on the last device: pin the draft there and reserve
+                // its bytes on that device, so the layer split leaves room for it
+                if (params.speculative.draft.devices.empty()) {
+                    if (attach_tail) {
+                        const std::vector<ggml_backend_dev_t> devs = common_params_offload_devices(params);
+                        if (!devs.empty()) {
+                            params.speculative.draft.devices = { devs.back(), nullptr };
+                            params.expert_cache_external_reserve_dev = (int32_t) (devs.size() - 1);
+                            params.draft_reserve_bytes = draft_bytes;
+                            COM_INF("%s: draft pinned to the last device (%s)\n",
+                                    __func__, ggml_backend_dev_name(devs.back()));
+                        }
+                    } else {
+                        COM_INF("%s: draft spread over the offload devices\n", __func__);
                     }
                 }
             }
