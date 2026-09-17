@@ -249,6 +249,57 @@ static bool run_round(ggml_backend_sched_t sched, ggml_context * ctx,
     return ok;
 }
 
+// Fully resident (whole-layer) pool: n_slots == n_expert, dedicated slots, no id remap.
+// The graph feeds the original ids straight to the pooled MUL_MAT_ID, so this also covers
+// the scheduler collect path that bypasses the map table.
+static bool run_round_fr(ggml_backend_sched_t sched, ggml_context * ctx, tensors & ts,
+        ggml_tensor * pool_gu, ggml_tensor * pool_dn, int n_tokens,
+        const std::vector<int32_t> & ids_data, const char * label) {
+    set_ids(ts, n_tokens, ids_data);
+
+    ggml_tensor * ids_view = ggml_view_2d(ctx, ts.ids_wide, n_used, n_tokens, ts.ids_wide->nb[1], 0);
+    ggml_tensor * x3 = ggml_reshape_3d(ctx,
+            ggml_view_2d(ctx, ts.x, n_in, n_tokens, ts.x->nb[1], 0), n_in, 1, n_tokens);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_tensor * ref_gu = ggml_mul_mat_id(ctx, ts.w_gu, x3, ids_view);
+    ggml_tensor * ref_dn = ggml_mul_mat_id(ctx, ts.w_dn, x3, ids_view);
+
+    // dedicated slots: slot == expert id, so the ids need no remap
+    ggml_tensor * out_gu = ggml_mul_mat_id(ctx, pool_gu, x3, ids_view);
+    ggml_tensor * out_dn = ggml_mul_mat_id(ctx, pool_dn, x3, ids_view);
+
+    ggml_build_forward_expand(gf, ref_gu);
+    ggml_build_forward_expand(gf, ref_dn);
+    ggml_build_forward_expand(gf, out_gu);
+    ggml_build_forward_expand(gf, out_dn);
+
+    ggml_backend_sched_reset(sched);
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", label);
+        return false;
+    }
+
+    bool ok = true;
+    for (auto & p : { std::make_pair(ref_gu, out_gu), std::make_pair(ref_dn, out_dn) }) {
+        const size_t nbytes = ggml_nbytes(p.first);
+        std::vector<uint8_t> host_ref(nbytes), host_out(nbytes);
+        ggml_backend_tensor_get(p.first, host_ref.data(), 0, nbytes);
+        ggml_backend_tensor_get(p.second, host_out.data(), 0, nbytes);
+
+        if (memcmp(host_ref.data(), host_out.data(), nbytes) != 0) {
+            ok = false;
+            fprintf(stderr, "%s: mismatch between fully-resident and reference outputs\n", label);
+        }
+    }
+
+    if (ok) {
+        printf("%s: ok\n", label);
+    }
+    return ok;
+}
+
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     // find an accelerator backend to host the pool
@@ -403,6 +454,66 @@ int main() {
                 n_failed++;
             }
             ggml_free(gctx);
+        }
+
+        // fully-resident pools (whole-layer pin): n_slots == n_expert, dedicated slots and
+        // no remap. a fresh sched because a tensor can only be pooled once per scheduler.
+        {
+            ggml_backend_t backends_fr[] = { accel, ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) };
+            ggml_backend_buffer_type_t bufts_fr[] = { accel_buft, ggml_backend_get_default_buffer_type(backends_fr[1]) };
+            ggml_backend_sched_t sched_fr = ggml_backend_sched_new(backends_fr, bufts_fr, 2, 4096, false, true);
+
+            ggml_tensor * table_gu_fr = nullptr;
+            ggml_tensor * table_dn_fr = nullptr;
+            ggml_tensor * pool_gu_fr = ggml_backend_sched_register_expert_pool(sched_fr, ts.w_gu, 0, n_expert, &table_gu_fr);
+            ggml_tensor * pool_dn_fr = ggml_backend_sched_register_expert_pool(sched_fr, ts.w_dn, 0, n_expert, &table_dn_fr);
+
+            if (pool_gu_fr && pool_dn_fr) {
+                const std::vector<int32_t> ids_fr = {0,1, 2,1, 3,0}; // 4 distinct experts
+                ggml_init_params gp = { 64 * ggml_tensor_overhead() + 8 * ggml_graph_overhead(), NULL, true };
+                char label[128];
+                bool ok = true;
+
+                ggml_context * gctx = ggml_init(gp);
+                snprintf(label, sizeof(label), "%s whole-layer round1 (cold)", ggml_type_name(type));
+                ok &= run_round_fr(sched_fr, gctx, ts, pool_gu_fr, pool_dn_fr, 3, ids_fr, label);
+                ggml_free(gctx);
+
+                gctx = ggml_init(gp);
+                snprintf(label, sizeof(label), "%s whole-layer round2 (hit)", ggml_type_name(type));
+                ok &= run_round_fr(sched_fr, gctx, ts, pool_gu_fr, pool_dn_fr, 3, ids_fr, label);
+                ggml_free(gctx);
+
+                // second round is a full hit and a whole pool never evicts: 4 misses per
+                // pool, 4 hits per pool, 0 evictions, 8 experts copied in total
+                long long hits = -1, misses = -1;
+                ggml_backend_sched_get_expert_pool_stats(sched_fr, &hits, &misses);
+                ggml_backend_sched_expert_pool_record recs[8];
+                const int n_recs = ggml_backend_sched_get_expert_pool_records(sched_fr, recs, 8);
+                uint64_t bytes = 0, evictions = 0;
+                for (int i = 0; i < n_recs; ++i) {
+                    bytes     += recs[i].bytes_copied;
+                    evictions += recs[i].n_evict;
+                }
+                const long long exp_hits   = 8;
+                const long long exp_misses = 8;
+                const uint64_t  exp_bytes  = (uint64_t) 8 * ts.w_gu->nb[2];
+                if (hits != exp_hits || misses != exp_misses || evictions != 0 || bytes != exp_bytes) {
+                    fprintf(stderr, "%s: whole-layer telemetry mismatch: hits=%lld misses=%lld evictions=%llu bytes=%llu (expected %lld/%lld/0/%llu)\n",
+                            ggml_type_name(type), hits, misses, (unsigned long long) evictions, (unsigned long long) bytes,
+                            exp_hits, exp_misses, (unsigned long long) exp_bytes);
+                    ok = false;
+                }
+                if (!ok) {
+                    n_failed++;
+                }
+            } else {
+                fprintf(stderr, "%s: failed to register the fully-resident pools\n", ggml_type_name(type));
+                n_failed++;
+            }
+
+            ggml_backend_free(backends_fr[1]);
+            ggml_backend_sched_free(sched_fr);
         }
 
         ggml_free(tctx);

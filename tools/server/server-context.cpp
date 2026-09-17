@@ -251,6 +251,7 @@ struct moe_telem_snap {
     uint64_t us    = 0;
     uint64_t step  = 0;
     int      n_expert   = 0;
+    int      n_expert_used = 0;
     int      n_slots    = 0;
     int      backend_id = -1;
 };
@@ -324,6 +325,7 @@ static void moe_telem_sample(llama_context * ctx, moe_telem_state & st) {
             s.hits       = recs[i].n_hits;
             s.miss       = recs[i].n_misses;
             s.n_expert   = recs[i].n_expert;
+            s.n_expert_used = recs[i].n_expert_used;
             s.n_slots    = recs[i].n_slots;
             s.backend_id = recs[i].backend_id;
             s.step       = recs[i].step;
@@ -437,53 +439,259 @@ static std::vector<std::string> moe_telem_format(moe_telem_state & st) {
     return out;
 }
 
-static std::vector<std::string> moe_telem_summary(const moe_telem_state & st) {
+static std::vector<std::string> moe_telem_summary(const moe_telem_state & st, const std::vector<int> & host_layers) {
     std::vector<std::string> out;
     if (!st.enabled || st.layers_map.empty()) {
         return out;
     }
 
+    // layers the user pinned to the host path (--mec-per-layer 0): they have no pool, so the
+    // telemetry cannot see them, but the suggestions must keep them at 0 instead of turning
+    // them back into dynamic layers
+    const auto is_host = [&](int layer) {
+        return std::find(host_layers.begin(), host_layers.end(), layer) != host_layers.end();
+    };
+
+    // per-layer averages over the generation
+    std::map<int, double> miss_ps;   // miss per step
+    std::map<int, double> copy_ps;   // MiB per step
+    std::map<int, double> upd_ps;    // ms per step
+    std::map<int, double> hit_pct;   // mean hit %
+    std::map<int, double> hit_sig;   // sigma
+    std::map<int, int>    cur_slots;
+    std::map<int, int>    n_expert;
+    std::map<int, int>    expert_used;
+    std::map<int, int>    dev_of;
+
     int      n_layers    = 0;
     int      max_layer   = -1;
     uint64_t total_steps = 0;
+
     for (const auto & kv : st.layers_map) {
+        const int layer = kv.first;
         const moe_telem_layer & l = kv.second;
         if (l.n_hit == 0 || l.steps == 0) {
             continue;
         }
+        const double mean = l.sum_hit / l.n_hit;
+        const double var  = std::max(0.0, l.sum_hit2 / l.n_hit - mean*mean);
+        hit_pct[layer]    = mean;
+        hit_sig[layer]    = std::sqrt(var);
+        miss_ps[layer]    = (double) l.miss / (double) l.steps;
+        copy_ps[layer]    = (double) l.bytes / (double) l.steps / 1024.0 / 1024.0;
+        upd_ps[layer]     = (double) l.us / (double) l.steps / 1000.0;
+        cur_slots[layer]  = l.prev.n_slots;
+        n_expert[layer]   = l.prev.n_expert;
+        expert_used[layer] = l.prev.n_expert_used;
+        dev_of[layer]     = l.prev.backend_id;
         n_layers++;
-        max_layer = std::max(max_layer, kv.first);
+        max_layer = std::max(max_layer, layer);
         total_steps = std::max(total_steps, l.steps);
     }
     if (n_layers == 0) {
         return out;
     }
 
+    int max_layer_all = max_layer;
+    for (int layer : host_layers) {
+        max_layer_all = std::max(max_layer_all, layer);
+    }
+
     out.push_back(string_format("moe summary: %d layers, %llu steps", n_layers, (unsigned long long) total_steps));
     for (int layer = 0; layer <= max_layer; ++layer) {
-        auto it = st.layers_map.find(layer);
-        if (it == st.layers_map.end()) {
+        auto it = hit_pct.find(layer);
+        if (it == hit_pct.end()) {
             continue;
         }
-        const moe_telem_layer & l = it->second;
-        if (l.n_hit == 0 || l.steps == 0) {
-            continue;
-        }
-        const double mean = l.sum_hit / l.n_hit;
-        const double var  = std::max(0.0, l.sum_hit2 / l.n_hit - mean*mean);
-        const double miss_ps = (double) l.miss / (double) l.steps;
-        const double copy_ps = (double) l.bytes / (double) l.steps / 1024.0 / 1024.0;
-        const double upd_ps  = (double) l.us / (double) l.steps / 1000.0;
         out.push_back(string_format("moe L%02d hit=%5.1f%%+-%4.1f%% miss=%.2f/stp copy=%.2fMiB/stp upd=%.2fms/stp",
-                layer, mean, std::sqrt(var), miss_ps, copy_ps, upd_ps));
+                layer, hit_pct[layer], hit_sig[layer], miss_ps[layer], copy_ps[layer], upd_ps[layer]));
     }
 
     for (const auto & kv : st.dev) {
         const moe_telem_dev & d = kv.second;
-        const double copy_ps = d.steps ? (double) d.bytes / (double) d.steps / 1024.0 / 1024.0 : 0.0;
-        const double upd_ps  = d.steps ? (double) d.us / (double) d.steps / 1000.0 : 0.0;
-        out.push_back(string_format("moe dev%d copy=%.2fMiB/stp upd=%.2fms/stp",
-                kv.first, copy_ps, upd_ps));
+        const double dev_copy = d.steps ? (double) d.bytes / (double) d.steps / 1024.0 / 1024.0 : 0.0;
+        const double dev_upd  = d.steps ? (double) d.us / (double) d.steps / 1000.0 : 0.0;
+        out.push_back(string_format("moe dev%d copy=%.2fMiB/stp upd=%.2fms/stp", kv.first, dev_copy, dev_upd));
+    }
+
+    if (!host_layers.empty()) {
+        std::string list;
+        for (int layer : host_layers) {
+            if (!list.empty()) {
+                list += ",";
+            }
+            list += std::to_string(layer);
+        }
+        out.push_back(string_format("moe note: layers %s are pinned to host (--mec-per-layer 0); they stay 0 in the suggestions; remove the pin for a clean baseline", list.c_str()));
+    }
+
+    // --mec-per-layer: nudge every layer's slots by how far its hit rate deviates from the
+    // average, divided by the layer's hit chance per slot (a slot buys less where the
+    // routing is already concentrated). The total is preserved by scaling, and the clamps
+    // keep the suggestion inside the model's expert range.
+    {
+        std::vector<int> sug(max_layer_all + 1, -1);
+
+        std::map<int, std::vector<int>> by_dev;
+        for (int layer = 0; layer <= max_layer; ++layer) {
+            if (hit_pct.find(layer) == hit_pct.end() || is_host(layer)) {
+                continue;
+            }
+            by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
+        }
+
+        for (const auto & kv : by_dev) {
+            const std::vector<int> & ls = kv.second;
+            if (ls.empty()) {
+                continue;
+            }
+
+            double avg_hit = 0.0;
+            long   sum_cur = 0;
+            for (int layer : ls) {
+                avg_hit += hit_pct[layer];
+                sum_cur += cur_slots[layer];
+            }
+            avg_hit /= (double) ls.size();
+
+            // preliminary budget: cur * avg / hit; a zero hit carries no information, keep cur
+            std::vector<double> pre(ls.size(), 0.0);
+            double sum_pre = 0.0;
+            for (size_t i = 0; i < ls.size(); ++i) {
+                const int layer = ls[i];
+                const int ne   = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+                const int nmin = std::max(1, expert_used[layer]);
+                const double h = hit_pct[layer];
+                double v = h > 0.0 ? (double) cur_slots[layer] * avg_hit / h : (double) cur_slots[layer];
+                v = std::max((double) nmin, std::min(v, (double) ne));
+                pre[i] = v;
+                sum_pre += v;
+            }
+
+            const double scale = sum_pre > 0.0 ? (double) sum_cur / sum_pre : 1.0;
+            long sum_sug = 0;
+            for (size_t i = 0; i < ls.size(); ++i) {
+                const int layer = ls[i];
+                const int ne   = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+                const int nmin = std::max(1, expert_used[layer]);
+                int val = (int) std::lround(pre[i] * scale);
+                val = std::max(nmin, std::min(val, ne));
+                sug[layer] = val;
+                sum_sug += val;
+            }
+
+            // keep the total unchanged: hand the residual to the first layer
+            const int layer = ls[0];
+            const int ne    = n_expert[layer] > 0 ? n_expert[layer] : cur_slots[layer];
+            const int nmin  = std::max(1, expert_used[layer]);
+            sug[layer] = std::max(nmin, std::min((int) (sug[layer] + (sum_cur - sum_sug)), ne));
+        }
+
+        // host-pinned layers stay off; their budget is not touched
+        for (int layer : host_layers) {
+            if (layer >= 0 && layer <= max_layer_all) {
+                sug[layer] = 0;
+            }
+        }
+
+        std::string list;
+        for (int layer = 0; layer <= max_layer_all; ++layer) {
+            if (!list.empty()) {
+                list += ",";
+            }
+            if (sug[layer] < 0) {
+                list += "a";
+            } else {
+                list += std::to_string(sug[layer]);
+            }
+        }
+        out.push_back(string_format("moe recommend: --mec-per-layer %s", list.c_str()));
+    }
+
+    // --mec-whole vs cache suppression for uniformly routed layers: a layer whose hit rate
+    // barely beats the random baseline gets little from the LRU cache. Pinning it whole (all
+    // n_expert slots) can starve the remaining layers, so when that drop is too large
+    // recommend running those layers on the host path instead (--mec-per-layer 0): their
+    // slots go to the layers where the cache does help.
+    {
+        std::map<int, std::vector<int>> by_dev;
+        for (int layer = 0; layer <= max_layer; ++layer) {
+            if (hit_pct.find(layer) == hit_pct.end() || is_host(layer)) {
+                continue;
+            }
+            by_dev[dev_of.count(layer) ? dev_of[layer] : -1].push_back(layer);
+        }
+
+        std::vector<int> sup_layers;
+        std::string      whole_list;
+        double           msg_avg_whole = 0.0;
+        double           msg_avg_off   = 0.0;
+        bool             msg_set       = false;
+
+        for (const auto & kv : by_dev) {
+            const std::vector<int> & ls = kv.second;
+            if (ls.empty()) {
+                continue;
+            }
+
+            std::vector<int> uni;
+            long   sum_cur     = 0;
+            double whole_slots = 0.0;
+            for (int layer : ls) {
+                sum_cur += cur_slots[layer];
+                if (n_expert[layer] <= 0 || cur_slots[layer] <= 0 || cur_slots[layer] == n_expert[layer]) {
+                    continue;
+                }
+                const double base = 100.0*(double) cur_slots[layer] / (double) n_expert[layer];
+                if (hit_pct[layer] < 1.5*base) {
+                    uni.push_back(layer);
+                    whole_slots += n_expert[layer];
+                }
+            }
+            if (uni.empty()) {
+                continue;
+            }
+
+            const int n_rem = (int) ls.size() - (int) uni.size();
+            if (n_rem > 0) {
+                const double avg_off   = (double) sum_cur / (double) n_rem;
+                const double avg_whole = std::max(0.0, (double) sum_cur - whole_slots) / (double) n_rem;
+                if (avg_whole < 0.8*avg_off) {
+                    sup_layers.insert(sup_layers.end(), uni.begin(), uni.end());
+                    if (!msg_set) {
+                        msg_avg_whole = avg_whole;
+                        msg_avg_off   = avg_off;
+                        msg_set       = true;
+                    }
+                    continue;
+                }
+            }
+            for (int layer : uni) {
+                if (!whole_list.empty()) {
+                    whole_list += ",";
+                }
+                whole_list += std::to_string(layer);
+            }
+        }
+
+        if (!sup_layers.empty()) {
+            std::string list;
+            for (int layer = 0; layer <= max_layer_all; ++layer) {
+                if (!list.empty()) {
+                    list += ",";
+                }
+                if (is_host(layer) || std::find(sup_layers.begin(), sup_layers.end(), layer) != sup_layers.end()) {
+                    list += "0";
+                } else {
+                    list += "a";
+                }
+            }
+            out.push_back(string_format("moe recommend: --mec-per-layer %s (uniform layers -> host path; pinning them whole would leave ~%.0f slots/layer vs ~%.0f without)",
+                    list.c_str(), msg_avg_whole, msg_avg_off));
+        }
+        if (!whole_list.empty()) {
+            out.push_back(string_format("moe recommend: --mec-whole %s", whole_list.c_str()));
+        }
     }
 
     return out;
@@ -623,6 +831,10 @@ struct server_slot {
 
     // per-layer MoE expert cache telemetry for the current generation
     moe_telem_state moe_telem;
+
+    // layers pinned to the host path (--mec-per-layer 0), from the launch params; not
+    // reset per generation because it is part of the launch config
+    std::vector<int> moe_off_layers;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -886,7 +1098,7 @@ struct server_slot {
         // capture the last ubatch before printing
         moe_telem_sample(ctx_tgt, moe_telem);
 
-        for (const std::string & line : moe_telem_summary(moe_telem)) {
+        for (const std::string & line : moe_telem_summary(moe_telem, moe_off_layers)) {
             SLT_INF(*this, "%s\n", line.c_str());
         }
     }
@@ -1529,6 +1741,16 @@ private:
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
+        }
+
+        // layers explicitly sent to the host path (--mec-per-layer 0): the telemetry
+        // suggestions must keep them at 0 instead of turning them dynamic again
+        for (size_t l = 0; l < params_base.expert_cache_per_layer.size(); ++l) {
+            if (params_base.expert_cache_per_layer[l] == 0) {
+                for (auto & slot : slots) {
+                    slot.moe_off_layers.push_back((int) l);
+                }
+            }
         }
 
         // try speculative decoding

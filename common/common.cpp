@@ -1749,6 +1749,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_whole_count = params.expert_cache_whole_count;
+    cparams.expert_cache_whole_layers = params.expert_cache_whole_layers.empty() ? nullptr : params.expert_cache_whole_layers.data();
+    cparams.n_expert_cache_whole_layers = (int32_t) params.expert_cache_whole_layers.size();
+    cparams.expert_cache_per_layer = params.expert_cache_per_layer.empty() ? nullptr : params.expert_cache_per_layer.data();
+    cparams.n_expert_cache_per_layer = (int32_t) params.expert_cache_per_layer.size();
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

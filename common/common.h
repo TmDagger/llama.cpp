@@ -473,6 +473,9 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     int32_t expert_cache_slots = 0;     // expert slots cached in VRAM per offloaded MoE weight tensor
+    int32_t expert_cache_whole_count = 0;   // keep all experts of the first N layers resident (0 = off)
+    std::vector<int32_t> expert_cache_whole_layers; // explicit layers to keep fully resident
+    std::vector<int32_t> expert_cache_per_layer;    // per-layer slot counts (-1 = dynamic, empty = all dynamic)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model

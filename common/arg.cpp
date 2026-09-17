@@ -2808,6 +2808,99 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
     add_opt(common_arg(
+        {"--mec-whole", "--moe-expert-cache-whole"}, "N | N0,N1,... | A-B,...",
+        "keep all experts of the given layers resident in VRAM (whole-layer pin)\n"
+        "a single number keeps the first N layers; otherwise a comma list of indices and\n"
+        "inclusive ranges, e.g. 0,1,5 or 0-2,5 (requires --moe-expert-cache, 0 = off)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_whole_layers.clear();
+            params.expert_cache_whole_count = 0;
+
+            const bool single_int = !value.empty() &&
+                std::all_of(value.begin(), value.end(), [](char c) { return std::isdigit((unsigned char) c) != 0; });
+            if (single_int) {
+                params.expert_cache_whole_count = std::stoi(value);
+                return;
+            }
+
+            std::set<int32_t> layers;
+            std::stringstream ss(value);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (tok.empty()) {
+                    continue;
+                }
+                const size_t dash = tok.find('-');
+                if (dash == std::string::npos) {
+                    const int32_t v = std::stoi(tok);
+                    if (v < 0) {
+                        throw std::invalid_argument("invalid layer");
+                    }
+                    layers.insert(v);
+                } else {
+                    const int32_t a = std::stoi(tok.substr(0, dash));
+                    const int32_t b = std::stoi(tok.substr(dash + 1));
+                    if (a < 0 || b < a) {
+                        throw std::invalid_argument("invalid layer range");
+                    }
+                    for (int32_t i = a; i <= b; ++i) {
+                        layers.insert(i);
+                    }
+                }
+            }
+            params.expert_cache_whole_layers.assign(layers.begin(), layers.end());
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WHOLE"));
+    add_opt(common_arg(
+        {"--mec-per-layer", "--moe-expert-cache-per-layer"}, "N0,N1,... | L:N | a",
+        "slots per expert tensor for individual layers, positional (in layer order) and/or as\n"
+        "L:N pairs; use 'a' for a dynamic layer that follows --moe-expert-cache and 0 to\n"
+        "disable the cache for that layer. explicit values are reserved from the budget first,\n"
+        "the dynamic layers scale down to fit (requires --moe-expert-cache)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_per_layer.clear();
+
+            const auto ensure = [&](int idx) {
+                if ((int) params.expert_cache_per_layer.size() <= idx) {
+                    params.expert_cache_per_layer.resize(idx + 1, -1);
+                }
+            };
+
+            int pos = 0;
+            std::stringstream ss(value);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (tok.empty()) {
+                    continue;
+                }
+                if (tok == "a" || tok == "A") {
+                    ensure(pos);
+                    params.expert_cache_per_layer[pos] = -1;
+                    pos++;
+                    continue;
+                }
+                const size_t colon = tok.find(':');
+                if (colon != std::string::npos) {
+                    const int idx = std::stoi(tok.substr(0, colon));
+                    const int v   = std::stoi(tok.substr(colon + 1));
+                    if (idx < 0 || v < 0) {
+                        throw std::invalid_argument("invalid layer or value");
+                    }
+                    ensure(idx);
+                    params.expert_cache_per_layer[idx] = v;
+                    continue;
+                }
+                const int v = std::stoi(tok);
+                if (v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                ensure(pos);
+                params.expert_cache_per_layer[pos] = v;
+                pos++;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_PER_LAYER"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

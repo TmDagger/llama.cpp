@@ -99,6 +99,7 @@ struct llm_graph_params;
 struct llama_expert_pool {
     ggml_tensor * pool  = nullptr; // expert slot pool on the compute backend (use as MUL_MAT_ID src[0])
     ggml_tensor * table = nullptr; // host I32 tensor mapping expert id -> slot id (graph input)
+    bool fully_resident = false;   // pool holds every expert: slot == expert id, no remap needed
 };
 
 using llama_expert_pools = std::unordered_map<const ggml_tensor *, llama_expert_pool>;
