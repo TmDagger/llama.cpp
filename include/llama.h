@@ -584,6 +584,30 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
+    // Per-pool MoE expert cache telemetry (debug). One record per pool on the context;
+    // the copy volume and update time expose per-layer differences that the aggregate
+    // hit rate hides. Valid only when an expert cache is active.
+    struct llama_expert_pool_record {
+        char     name[128];
+        int      layer;          // parsed from "blk.<N>." (-1 if unknown)
+        int      backend_id;
+        int      n_expert;
+        int      n_slots;
+        int      n_free;
+        uint64_t n_hits;
+        uint64_t n_misses;
+        uint64_t n_evict;
+        uint64_t bytes_copied;
+        uint64_t us_update;
+        uint64_t step;
+    };
+
+    // Fill up to max_records records; returns the number written.
+    LLAMA_API int llama_get_expert_pool_records(
+        const struct llama_context * ctx,
+        struct llama_expert_pool_record * records,
+        int max_records);
+
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 

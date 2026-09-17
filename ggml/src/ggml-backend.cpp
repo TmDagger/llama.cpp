@@ -787,6 +787,9 @@ struct ggml_backend_sched_expert_pool {
     int n_slots;
     size_t expert_size;      // == w->nb[2]
 
+    int layer = -1;          // parsed from "blk.<N>." for telemetry
+    int backend_id = -1;
+
     // slot bookkeeping (host side)
     std::vector<int32_t>  expert_slot; // [n_expert], -1 = not cached
     std::vector<int32_t>  slot_expert; // [n_slots], -1 = free
@@ -797,6 +800,10 @@ struct ggml_backend_sched_expert_pool {
     // running totals, reported when GGML_MOE_POOL_STATS is set
     uint64_t n_hits = 0;
     uint64_t n_misses = 0;
+    uint64_t n_evict = 0;
+    uint64_t bytes_copied = 0; // host -> device expert bytes
+    uint64_t us_update = 0;    // host-side update time
+    uint64_t step = 0;         // pool updates (decode steps) seen
     bool report_stats = false;
     uint64_t n_reports = 0;
 
@@ -2067,6 +2074,9 @@ static void ggml_backend_sched_update_expert_pool(
 
     int32_t * table = (int32_t *) ep.table->data;
 
+    const int64_t t_start = ggml_time_us();
+    ep.step++;
+
     // stamps assigned during this update, used to guarantee that eviction never picks a slot
     // that was loaded or refreshed by the current ubatch
     const uint64_t stamp_base = ep.stamp;
@@ -2106,12 +2116,15 @@ static void ggml_backend_sched_update_expert_pool(
             // if this fires, a graph with more experts than slots was routed through the pool
             GGML_ASSERT(ep.slot_stamp[slot] <= stamp_base && "expert pool overflow: the ubatch uses more distinct experts than there are slots");
             ep.expert_slot[ep.slot_expert[slot]] = -1;
+            ep.n_evict++;
         }
 
         ep.slot_expert[slot] = e;
         ep.expert_slot[e]    = slot;
         ep.slot_stamp[slot]  = ++ep.stamp;
         table[e] = slot;
+
+        ep.bytes_copied += ep.expert_size;
 
         // copy the expert from the host weights into its slot. synchronous on purpose:
         // this matches the stock selective-copy path (the ubatch cannot proceed before
@@ -2131,11 +2144,18 @@ static void ggml_backend_sched_update_expert_pool(
     // keeps the update -> upload -> remap order under the pool's own control
     ggml_backend_tensor_set(ep.table_dev, ep.table->data, 0, ggml_nbytes(ep.table));
 
+    ep.us_update += (uint64_t) (ggml_time_us() - t_start);
+
     if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
         ep.n_reports++;
-        GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses), %d of %d slots free\n",
+        const double mb_copied = (double) ep.bytes_copied / 1024.0 / 1024.0;
+        const double ms_update = (double) ep.us_update / 1000.0;
+        GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses), %llu evictions, "
+                "copied %.1f MiB, update %.1f ms (%llu steps), %d of %d slots free\n",
                 __func__, ep.w->name, 100.0 * ep.n_hits / (ep.n_hits + ep.n_misses),
-                (unsigned long long) ep.n_hits, (unsigned long long) ep.n_misses, ep.n_free, ep.n_slots);
+                (unsigned long long) ep.n_hits, (unsigned long long) ep.n_misses,
+                (unsigned long long) ep.n_evict, mb_copied, ms_update,
+                (unsigned long long) ep.step, ep.n_free, ep.n_slots);
     }
 }
 
@@ -2241,6 +2261,15 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.n_expert  = n_expert;
     ep.n_slots   = n_slots;
     ep.expert_size = esz;
+    ep.backend_id = backend_id;
+    ep.layer = -1;
+    if (strncmp(w->name, "blk.", 4) == 0) {
+        char * end = nullptr;
+        const long l = strtol(w->name + 4, &end, 10);
+        if (end != nullptr && *end == '.') {
+            ep.layer = (int) l;
+        }
+    }
     ep.expert_slot.assign(n_expert, -1);
     ep.slot_expert.assign(n_slots, -1);
     ep.slot_stamp.assign(n_slots, 0);
@@ -2289,6 +2318,38 @@ void ggml_backend_sched_get_expert_pool_stats(
             *misses += (long long) ep.n_misses;
         }
     }
+}
+
+int ggml_backend_sched_get_expert_pool_records(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_expert_pool_record * records,
+        int max_records) {
+    if (sched == NULL || records == NULL || max_records <= 0) {
+        return 0;
+    }
+
+    int n = 0;
+    for (const auto & ep : sched->expert_pools) {
+        if (n >= max_records) {
+            break;
+        }
+        struct ggml_backend_sched_expert_pool_record & r = records[n];
+        memset(&r, 0, sizeof(r));
+        snprintf(r.name, sizeof(r.name), "%s", ep.w->name);
+        r.layer        = ep.layer;
+        r.backend_id   = ep.backend_id;
+        r.n_expert     = ep.n_expert;
+        r.n_slots      = ep.n_slots;
+        r.n_free       = ep.n_free;
+        r.n_hits       = ep.n_hits;
+        r.n_misses     = ep.n_misses;
+        r.n_evict      = ep.n_evict;
+        r.bytes_copied = ep.bytes_copied;
+        r.us_update    = ep.us_update;
+        r.step         = ep.step;
+        n++;
+    }
+    return n;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(

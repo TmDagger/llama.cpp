@@ -132,6 +132,8 @@ struct stats_model {
     int n_cached = 0;
     long long hits = 0;
     long long misses = 0;
+    uint64_t bytes = 0;          // copied bytes, one expert per miss
+    uint64_t expert_size = 0;    // bytes per expert
 
     stats_model(int n_expert_, int n_slots_) : stamp(n_expert_, 0), n_slots(n_slots_) {}
 
@@ -149,6 +151,7 @@ struct stats_model {
                 hits++;
             } else {
                 misses++;
+                bytes += expert_size;
                 if (n_cached == n_slots) {
                     int victim = -1;
                     for (int c = 0; c < n_expert_; c++) {
@@ -318,6 +321,7 @@ int main() {
         // so the reference model lives alongside the sched; both test pools share one
         // routing, so the sched totals must be exactly twice the single-pool model
         stats_model model(n_expert, n_slots);
+        model.expert_size = ts.w_gu->nb[2];
         auto check_stats = [&](const char * label, bool & ok) {
             long long hits = -1, misses = -1;
             ggml_backend_sched_get_expert_pool_stats(sched, &hits, &misses);
@@ -326,6 +330,20 @@ int main() {
             if (hits != exp_hits || misses != exp_misses) {
                 fprintf(stderr, "%s: hit-rate telemetry mismatch: sched reports hits=%lld misses=%lld,"
                         " expected hits=%lld misses=%lld\n", label, hits, misses, exp_hits, exp_misses);
+                ok = false;
+            }
+
+            // copy volume: every miss copies exactly one expert, summed over both pools
+            ggml_backend_sched_expert_pool_record recs[8];
+            const int n_recs = ggml_backend_sched_get_expert_pool_records(sched, recs, 8);
+            uint64_t bytes = 0;
+            for (int i = 0; i < n_recs; ++i) {
+                bytes += recs[i].bytes_copied;
+            }
+            const uint64_t exp_bytes = 2 * model.bytes;
+            if (bytes != exp_bytes) {
+                fprintf(stderr, "%s: copy-volume telemetry mismatch: sched reports %llu bytes,"
+                        " expected %llu\n", label, (unsigned long long) bytes, (unsigned long long) exp_bytes);
                 ok = false;
             }
         };

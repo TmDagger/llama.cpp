@@ -4024,6 +4024,37 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
+int llama_get_expert_pool_records(
+        const struct llama_context * ctx,
+        struct llama_expert_pool_record * records,
+        int max_records) {
+    if (!ctx || !records || max_records <= 0) {
+        return 0;
+    }
+
+    std::vector<struct ggml_backend_sched_expert_pool_record> tmp(max_records);
+    const int n = ggml_backend_sched_get_expert_pool_records(ctx->get_sched(), tmp.data(), max_records);
+
+    for (int i = 0; i < n; ++i) {
+        const struct ggml_backend_sched_expert_pool_record & g = tmp[i];
+        struct llama_expert_pool_record & r = records[i];
+        memset(&r, 0, sizeof(r));
+        snprintf(r.name, sizeof(r.name), "%s", g.name);
+        r.layer        = g.layer;
+        r.backend_id   = g.backend_id;
+        r.n_expert     = g.n_expert;
+        r.n_slots      = g.n_slots;
+        r.n_free       = g.n_free;
+        r.n_hits       = g.n_hits;
+        r.n_misses     = g.n_misses;
+        r.n_evict      = g.n_evict;
+        r.bytes_copied = g.bytes_copied;
+        r.us_update    = g.us_update;
+        r.step         = g.step;
+    }
+    return n;
+}
+
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 

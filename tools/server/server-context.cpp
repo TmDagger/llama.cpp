@@ -18,8 +18,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -236,6 +238,259 @@ struct server_batch {
     }
 };
 
+// Per-layer MoE expert cache telemetry (debug), enabled by GGML_MOE_POOL_STATS. The
+// per-step lines additionally need GGML_MOE_POOL_STATS_LAYERS. The state lives in the
+// slot so the accumulators cover exactly one generation.
+namespace {
+
+struct moe_telem_snap {
+    uint64_t hits  = 0;
+    uint64_t miss  = 0;
+    uint64_t ev    = 0;
+    uint64_t bytes = 0;
+    uint64_t us    = 0;
+    uint64_t step  = 0;
+    int      n_expert   = 0;
+    int      n_slots    = 0;
+    int      backend_id = -1;
+};
+
+struct moe_telem_layer {
+    moe_telem_snap prev;
+    bool has_prev = false;
+
+    // per-generation accumulators
+    double   sum_hit  = 0.0;
+    double   sum_hit2 = 0.0;
+    uint64_t n_hit    = 0;
+    uint64_t miss     = 0;
+    uint64_t bytes    = 0;
+    uint64_t us       = 0;
+    uint64_t steps    = 0;
+
+    // periodic output history
+    std::deque<std::pair<int64_t, moe_telem_snap>> hist;
+};
+
+struct moe_telem_dev {
+    uint64_t bytes = 0;
+    uint64_t us    = 0;
+    uint64_t steps = 0;
+};
+
+struct moe_telem_state {
+    bool checked = false;
+    bool enabled = false; // GGML_MOE_POOL_STATS
+    bool layers  = false; // GGML_MOE_POOL_STATS_LAYERS
+    int64_t t_out = 0;
+    std::map<int, moe_telem_layer> layers_map;
+    std::map<int, moe_telem_dev>   dev;
+};
+
+static void moe_telem_check(moe_telem_state & st) {
+    if (st.checked) {
+        return;
+    }
+    st.checked = true;
+    st.enabled = getenv("GGML_MOE_POOL_STATS") != nullptr;
+    st.layers  = getenv("GGML_MOE_POOL_STATS_LAYERS") != nullptr;
+}
+
+static void moe_telem_sample(llama_context * ctx, moe_telem_state & st) {
+    moe_telem_check(st);
+    if (!st.enabled || ctx == nullptr) {
+        return;
+    }
+
+    static std::vector<llama_expert_pool_record> recs;
+    recs.resize(256);
+    int n = llama_get_expert_pool_records(ctx, recs.data(), (int) recs.size());
+    if (n == (int) recs.size()) {
+        recs.resize(recs.size()*2);
+        n = llama_get_expert_pool_records(ctx, recs.data(), (int) recs.size());
+    }
+
+    // aggregate per layer: hits/miss come from the first (representative) tensor of the
+    // layer, the remaining counters are summed over the layer's tensors
+    std::map<int, moe_telem_snap> cur;
+    for (int i = 0; i < n; ++i) {
+        const int layer = recs[i].layer;
+        if (layer < 0) {
+            continue;
+        }
+        auto it = cur.find(layer);
+        if (it == cur.end()) {
+            auto & s = cur[layer];
+            s.hits       = recs[i].n_hits;
+            s.miss       = recs[i].n_misses;
+            s.n_expert   = recs[i].n_expert;
+            s.n_slots    = recs[i].n_slots;
+            s.backend_id = recs[i].backend_id;
+            s.step       = recs[i].step;
+            it = cur.find(layer);
+        }
+        auto & s = it->second;
+        s.ev    += recs[i].n_evict;
+        s.bytes += recs[i].bytes_copied;
+        s.us    += recs[i].us_update;
+        s.step   = std::max<uint64_t>(s.step, recs[i].step);
+    }
+
+    const int64_t now = ggml_time_us();
+    for (const auto & kv : cur) {
+        moe_telem_layer & l = st.layers_map[kv.first];
+        const moe_telem_snap & c = kv.second;
+        if (l.has_prev) {
+            const moe_telem_snap & p = l.prev;
+            const uint64_t dh = c.hits - p.hits;
+            const uint64_t dm = c.miss - p.miss;
+            const uint64_t dt = c.step > p.step ? c.step - p.step : 1;
+            const double h = (dh + dm) ? 100.0*(double)dh/(double)(dh + dm) : 100.0;
+            const uint64_t db = c.bytes - p.bytes;
+            const uint64_t du = c.us - p.us;
+
+            l.sum_hit  += h;
+            l.sum_hit2 += h*h;
+            l.n_hit++;
+            l.miss  += dm;
+            l.bytes += db;
+            l.us    += du;
+            l.steps += dt;
+
+            if (c.backend_id >= 0) {
+                moe_telem_dev & d = st.dev[c.backend_id];
+                d.bytes += db;
+                d.us    += du;
+                d.steps  = std::max(d.steps, l.steps);
+            }
+        }
+        l.prev     = c;
+        l.has_prev = true;
+
+        if (st.layers) {
+            l.hist.emplace_back(now, c);
+            while (!l.hist.empty() && now - l.hist.front().first > 60*1000*1000) {
+                l.hist.pop_front();
+            }
+        }
+    }
+}
+
+static std::vector<std::string> moe_telem_format(moe_telem_state & st) {
+    std::vector<std::string> out;
+    if (!st.enabled || !st.layers) {
+        return out;
+    }
+
+    const int64_t now = ggml_time_us();
+
+    for (auto & kv : st.layers_map) {
+        const int layer = kv.first;
+        moe_telem_layer & l = kv.second;
+        const auto & dq = l.hist;
+        if (dq.size() < 2) {
+            continue;
+        }
+
+        // baseline: last sample at or before the last output
+        size_t b = 0;
+        while (b + 1 < dq.size() && dq[b + 1].first <= st.t_out) {
+            ++b;
+        }
+
+        const auto & first = dq[b].second;
+        const auto & last  = dq.back().second;
+        const uint64_t dsteps = last.step > first.step ? last.step - first.step : 0;
+
+        double sum  = 0.0;
+        double sum2 = 0.0;
+        int    ns   = 0;
+        for (size_t i = b + 1; i < dq.size(); ++i) {
+            const auto & p = dq[i-1].second;
+            const auto & c = dq[i].second;
+            const uint64_t dh = c.hits - p.hits;
+            const uint64_t dm = c.miss - p.miss;
+            const double h = (dh + dm) ? 100.0*(double)dh/(double)(dh + dm) : 100.0;
+            sum  += h;
+            sum2 += h*h;
+            ++ns;
+        }
+
+        std::string hit_str = "n/a";
+        if (ns > 0) {
+            const double mean = sum / ns;
+            const double var  = std::max(0.0, sum2 / ns - mean*mean);
+            hit_str = string_format("%.1f%%+-%.1f%%", mean, std::sqrt(var));
+        }
+
+        const uint64_t d_b = last.bytes - first.bytes;
+        const uint64_t d_u = last.us  - first.us;
+
+        const double copy_step = dsteps ? (double) d_b / (double) dsteps / 1024.0 / 1024.0 : 0.0;
+        const double upd_step  = dsteps ? (double) d_u / (double) dsteps / 1000.0 : 0.0;
+
+        out.push_back(string_format("moe L%02d hit=%s copy=%.2fMiB/stp upd=%.2fms/stp",
+                layer, hit_str.c_str(), copy_step, upd_step));
+    }
+
+    st.t_out = now;
+    return out;
+}
+
+static std::vector<std::string> moe_telem_summary(const moe_telem_state & st) {
+    std::vector<std::string> out;
+    if (!st.enabled || st.layers_map.empty()) {
+        return out;
+    }
+
+    int      n_layers    = 0;
+    int      max_layer   = -1;
+    uint64_t total_steps = 0;
+    for (const auto & kv : st.layers_map) {
+        const moe_telem_layer & l = kv.second;
+        if (l.n_hit == 0 || l.steps == 0) {
+            continue;
+        }
+        n_layers++;
+        max_layer = std::max(max_layer, kv.first);
+        total_steps = std::max(total_steps, l.steps);
+    }
+    if (n_layers == 0) {
+        return out;
+    }
+
+    out.push_back(string_format("moe summary: %d layers, %llu steps", n_layers, (unsigned long long) total_steps));
+    for (int layer = 0; layer <= max_layer; ++layer) {
+        auto it = st.layers_map.find(layer);
+        if (it == st.layers_map.end()) {
+            continue;
+        }
+        const moe_telem_layer & l = it->second;
+        if (l.n_hit == 0 || l.steps == 0) {
+            continue;
+        }
+        const double mean = l.sum_hit / l.n_hit;
+        const double var  = std::max(0.0, l.sum_hit2 / l.n_hit - mean*mean);
+        const double miss_ps = (double) l.miss / (double) l.steps;
+        const double copy_ps = (double) l.bytes / (double) l.steps / 1024.0 / 1024.0;
+        const double upd_ps  = (double) l.us / (double) l.steps / 1000.0;
+        out.push_back(string_format("moe L%02d hit=%5.1f%%+-%4.1f%% miss=%.2f/stp copy=%.2fMiB/stp upd=%.2fms/stp",
+                layer, mean, std::sqrt(var), miss_ps, copy_ps, upd_ps));
+    }
+
+    for (const auto & kv : st.dev) {
+        const moe_telem_dev & d = kv.second;
+        const double copy_ps = d.steps ? (double) d.bytes / (double) d.steps / 1024.0 / 1024.0 : 0.0;
+        const double upd_ps  = d.steps ? (double) d.us / (double) d.steps / 1000.0 : 0.0;
+        out.push_back(string_format("moe dev%d copy=%.2fMiB/stp upd=%.2fms/stp",
+                kv.first, copy_ps, upd_ps));
+    }
+
+    return out;
+}
+
+} // namespace
+
 struct server_slot {
     int id;
 
@@ -366,8 +621,13 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // per-layer MoE expert cache telemetry for the current generation
+    moe_telem_state moe_telem;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
+
+        moe_telem = moe_telem_state{};
 
         spec_is_replay = false;
 
@@ -596,6 +856,8 @@ struct server_slot {
     }
 
     void print_timings_tg() {
+        moe_telem_sample(ctx_tgt, moe_telem);
+
         if (stats.n_gen < 100) {
             return;
         }
@@ -613,6 +875,20 @@ struct server_slot {
         n_gen_last = stats.n_gen;
 
         SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
+
+        // per-layer MoE expert cache telemetry next to the generation rate (debug)
+        for (const std::string & line : moe_telem_format(moe_telem)) {
+            SLT_INF(*this, "%s\n", line.c_str());
+        }
+    }
+
+    void print_moe_summary() {
+        // capture the last ubatch before printing
+        moe_telem_sample(ctx_tgt, moe_telem);
+
+        for (const std::string & line : moe_telem_summary(moe_telem)) {
+            SLT_INF(*this, "%s\n", line.c_str());
+        }
     }
 
     void print_timings_pp() const {
@@ -3858,6 +4134,7 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
+                slot.print_moe_summary();
                 send_final_response(slot);
                 slot.release();
 
@@ -3983,6 +4260,7 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    slot.print_moe_summary();
                     send_final_response(slot);
                     slot.release();
 

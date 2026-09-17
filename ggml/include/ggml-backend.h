@@ -386,6 +386,31 @@ extern "C" {
         long long * hits,   // may be NULL
         long long * misses); // may be NULL
 
+    // per-pool expert-cache telemetry, one record per registered pool; callers can
+    // aggregate by layer. the copy volume and update time make per-layer differences
+    // visible: a hit-rate average can look fine while one layer copies far more than
+    // another. counters are cumulative over the scheduler lifetime
+    struct ggml_backend_sched_expert_pool_record {
+        char     name[128];
+        int      layer;          // parsed from "blk.<N>." (-1 if unknown)
+        int      backend_id;
+        int      n_expert;
+        int      n_slots;
+        int      n_free;
+        uint64_t n_hits;
+        uint64_t n_misses;
+        uint64_t n_evict;        // experts evicted to free a slot
+        uint64_t bytes_copied;   // host -> device copy volume
+        uint64_t us_update;      // time spent issuing pool updates
+        uint64_t step;           // pool updates (decode steps) seen
+    };
+
+    // fill up to max_records records, returns the number written
+    GGML_API int ggml_backend_sched_get_expert_pool_records(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_expert_pool_record * records,
+        int max_records);
+
     //
     // Meta backend
     //

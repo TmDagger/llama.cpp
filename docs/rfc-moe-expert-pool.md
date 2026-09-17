@@ -151,6 +151,18 @@ is archived in
    the LRU state between four replays of the same anchor prompt: anchor outputs
    byte-identical (same SHA-1 four times), throughput stable (13.9–15.3 t/s).
 
+## Telemetry
+
+`GGML_MOE_POOL_STATS=1` logs a per-tensor line every 512 cache events with the hit
+rate, evictions, copied bytes and pool update time. `ggml_backend_sched_get_expert_pool_records()`
+returns the same counters per pool (name, layer, backend, slots, hits, misses, evictions,
+bytes copied, update time, updates) so tooling and the server can aggregate per layer
+without parsing logs. The copy volume and update time are what make a layer split
+visible: a hit-rate average can look acceptable while one layer copies far more than
+another. `llama-server` prints a per-layer summary of these counters at the end of a
+generation when `GGML_MOE_POOL_STATS=1`, and a per-step line when
+`GGML_MOE_POOL_STATS_LAYERS=1`.
+
 ## Maintenance footprint
 
 ~700 lines: `ggml-backend.cpp` (+~350: pool struct, register/update, split hooks),
