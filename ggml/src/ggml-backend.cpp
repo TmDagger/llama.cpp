@@ -789,6 +789,7 @@ struct ggml_backend_sched_expert_pool {
 
     int layer = -1;          // parsed from "blk.<N>." for telemetry
     int backend_id = -1;
+    bool fully_resident = false; // n_slots == n_expert: dedicated slots, no remap or eviction
 
     // slot bookkeeping (host side)
     std::vector<int32_t>  expert_slot; // [n_expert], -1 = not cached
@@ -1815,8 +1816,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 auto it = sched->expert_pool_by_buf.find(src0->buffer);
                 if (it != sched->expert_pool_by_buf.end()) {
-                    ggml_backend_sched_update_expert_pool(sched, sched->expert_pools[it->second],
-                        ggml_backend_sched_expert_pool_unwrap_ids(node->src[2]), split_backend);
+                    auto & ep = sched->expert_pools[it->second];
+                    // a fully resident pool has no GET_ROWS remap, so src[2] holds the
+                    // original router ids: peel the cont/reshape view instead of unwrapping
+                    // the remap chain
+                    const struct ggml_tensor * ids = node->src[2];
+                    if (ep.fully_resident) {
+                        while (ids != NULL && (ids->op == GGML_OP_RESHAPE || ids->op == GGML_OP_CONT)) {
+                            ids = ids->src[0];
+                        }
+                    } else {
+                        ids = ggml_backend_sched_expert_pool_unwrap_ids(ids);
+                    }
+                    ggml_backend_sched_update_expert_pool(sched, ep, ids, split_backend);
                 }
             }
         }
@@ -2091,13 +2103,19 @@ static void ggml_backend_sched_update_expert_pool(
             // cache hit - refresh the LRU stamp
             ep.n_hits++;
             ep.slot_stamp[slot] = ++ep.stamp;
-            table[e] = slot;
+            if (!ep.fully_resident) {
+                table[e] = slot;
+            }
             continue;
         }
         ep.n_misses++;
 
-        // cache miss - prefer a free slot, otherwise evict the least recently used one
-        if (ep.n_free > 0) {
+        if (ep.fully_resident) {
+            // dedicated slot: expert e always lives in slot e, no eviction and no remap
+            slot = e;
+            ep.n_free--;
+        } else if (ep.n_free > 0) {
+            // cache miss - prefer a free slot
             for (int s = 0; s < ep.n_slots; s++) {
                 if (ep.slot_expert[s] < 0) {
                     slot = s;
@@ -2106,6 +2124,7 @@ static void ggml_backend_sched_update_expert_pool(
                 }
             }
         } else {
+            // otherwise evict the least recently used slot
             slot = 0;
             for (int s = 1; s < ep.n_slots; s++) {
                 if (ep.slot_stamp[s] < ep.slot_stamp[slot]) {
@@ -2122,7 +2141,9 @@ static void ggml_backend_sched_update_expert_pool(
         ep.slot_expert[slot] = e;
         ep.expert_slot[e]    = slot;
         ep.slot_stamp[slot]  = ++ep.stamp;
-        table[e] = slot;
+        if (!ep.fully_resident) {
+            table[e] = slot;
+        }
 
         ep.bytes_copied += ep.expert_size;
 
@@ -2170,7 +2191,7 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     GGML_ASSERT(w->op == GGML_OP_NONE);
     GGML_ASSERT(w->buffer != NULL && ggml_backend_buffer_is_host(w->buffer));
     GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
-    GGML_ASSERT(n_slots > 0 && n_slots < w->ne[2]);
+    GGML_ASSERT(n_slots > 0 && n_slots <= w->ne[2]);
 
     for (const auto & ep : sched->expert_pools) {
         GGML_ASSERT(ep.w != w && "expert pool already registered for this tensor");
@@ -2262,6 +2283,7 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.n_slots   = n_slots;
     ep.expert_size = esz;
     ep.backend_id = backend_id;
+    ep.fully_resident = (n_slots == n_expert);
     ep.layer = -1;
     if (strncmp(w->name, "blk.", 4) == 0) {
         char * end = nullptr;
@@ -2276,6 +2298,15 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     ep.n_free  = n_slots;
     ep.stamp   = 0;
     ep.report_stats = getenv("GGML_MOE_POOL_STATS") != NULL;
+
+    // fully resident pools use dedicated slots (slot == expert id), so seed an identity map
+    // (the graph skips the remap for these, the table is only kept for completeness)
+    if (ep.fully_resident) {
+        int32_t * t = (int32_t *) table->data;
+        for (int e = 0; e < n_expert; ++e) {
+            t[e] = e;
+        }
+    }
 
     sched->expert_pools.push_back(std::move(ep));
     sched->expert_pool_by_buf[pool_buf] = (int) sched->expert_pools.size() - 1;

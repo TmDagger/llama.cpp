@@ -23,6 +23,9 @@ struct llama_cparams {
 
     // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
     int32_t  expert_cache_slots = 0;
+    int32_t  expert_cache_whole_count = 0;  // keep all experts of the first N layers resident (0 = off)
+    std::vector<int32_t> expert_cache_whole_layers; // explicit layers to keep fully resident
+    std::vector<int32_t> expert_cache_per_layer;    // per-layer slot counts (-1 = dynamic)
 
     float rope_freq_base;
     float rope_freq_scale;

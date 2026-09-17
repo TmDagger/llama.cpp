@@ -368,6 +368,11 @@ extern "C" {
         int32_t  n_threads_batch;       // number of threads to use for batch processing
         int32_t  expert_cache_slots;    // number of expert slots cached in VRAM per offloaded
                                        // MoE expert weight tensor (0 = disabled) [EXPERIMENTAL]
+        int32_t  expert_cache_whole_count; // keep all experts of the first N layers resident (0 = off) [EXPERIMENTAL]
+        const int32_t * expert_cache_whole_layers; // explicit layers to keep fully resident; null = none [EXPERIMENTAL]
+        int32_t  n_expert_cache_whole_layers; // number of entries in expert_cache_whole_layers [EXPERIMENTAL]
+        const int32_t * expert_cache_per_layer; // per-layer slot counts, -1 = dynamic; null = all dynamic [EXPERIMENTAL]
+        int32_t  n_expert_cache_per_layer;      // number of entries in expert_cache_per_layer [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -593,6 +598,7 @@ extern "C" {
         int      backend_id;
         int      n_expert;
         int      n_slots;
+        int      n_expert_used;  // model top-k for this layer (0 = unknown)
         int      n_free;
         uint64_t n_hits;
         uint64_t n_misses;

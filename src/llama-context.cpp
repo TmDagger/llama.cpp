@@ -274,6 +274,15 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
 
     cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_cache_whole_count = params.expert_cache_whole_count;
+    if (params.expert_cache_whole_layers != nullptr) {
+        cparams.expert_cache_whole_layers.assign(params.expert_cache_whole_layers,
+                params.expert_cache_whole_layers + params.n_expert_cache_whole_layers);
+    }
+    if (params.expert_cache_per_layer != nullptr) {
+        cparams.expert_cache_per_layer.assign(params.expert_cache_per_layer,
+                params.expert_cache_per_layer + params.n_expert_cache_per_layer);
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -588,6 +597,10 @@ void llama_context::init_expert_pools() {
     expert_pools.clear();
 
     if (cparams.expert_cache_slots <= 0) {
+        if (cparams.expert_cache_whole_count > 0 || !cparams.expert_cache_whole_layers.empty() ||
+                !cparams.expert_cache_per_layer.empty()) {
+            LLAMA_LOG_WARN("%s: --mec-whole/--mec-per-layer ignored: expert cache is disabled (-mec 0)\n", __func__);
+        }
         return;
     }
 
@@ -662,10 +675,51 @@ void llama_context::init_expert_pools() {
                 __func__, pool_rail / 1024.0 / 1024.0 / 1024.0);
     }
 
+    // whole-layer pin: keep every expert of these layers resident in VRAM
+    auto is_whole_layer = [&](int il) -> bool {
+        if (il < cparams.expert_cache_whole_count) {
+            return true;
+        }
+        return std::find(cparams.expert_cache_whole_layers.begin(),
+                         cparams.expert_cache_whole_layers.end(), il) != cparams.expert_cache_whole_layers.end();
+    };
+
+    // per-layer slot override: -1 = dynamic, 0 = cache disabled for the layer
+    auto per_layer_slots = [&](int il) -> int32_t {
+        if (il >= 0 && il < (int) cparams.expert_cache_per_layer.size()) {
+            return cparams.expert_cache_per_layer[il];
+        }
+        return -1;
+    };
+
+    // pool footprint on the device, mirrors the register-side allocation
+    // (n_slots * expert_size + a small NaN-safe tail)
+    auto moe_pool_footprint = [](const ggml_tensor * w, int n_slots) -> size_t {
+        const size_t esz = w->nb[2];
+        return (size_t) n_slots * esz + std::min<size_t>(esz, 512);
+    };
+
     // pool every MoE expert weight tensor that is actually offloaded to the host; when a
     // layer has both fused gate_up and separate gate/up tensors only the fused one is
     // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
-    for (const auto & layer : model.layers) {
+    struct plan_entry {
+        ggml_tensor * w;
+        int  n_slots;
+        char kind; // 0 = dynamic, 1 = explicit per-layer, 2 = whole layer
+    };
+    std::vector<plan_entry> plan;
+
+    for (int il = 0; il < (int) model.layers.size(); ++il) {
+        const auto & layer = model.layers[il];
+        const bool    whole     = is_whole_layer(il);
+        const int32_t per_layer = per_layer_slots(il);
+        if (whole && per_layer >= 0) {
+            LLAMA_LOG_WARN("%s: layer %d is both --mec-whole and --mec-per-layer, whole layer wins\n", __func__, il);
+        }
+        if (!whole && per_layer == 0) {
+            continue; // cache explicitly disabled for this layer
+        }
+
         // the collector is unbounded on purpose: expert-tensor layouts vary by arch
         // (fused gate_up + down, separate up/gate/down, ...) and future ones may carry
         // any number of expert tensors per layer
@@ -686,29 +740,132 @@ void llama_context::init_expert_pools() {
             }
 
             const int n_expert = (int) w->ne[2];
-            const int n_slots  = std::min<int64_t>((int64_t) cparams.expert_cache_slots, n_expert - 1);
+            int  n_slots = 0;
+            char kind    = 0;
+            if (whole) {
+                // dedicated slot per expert, no remap and no eviction
+                n_slots = n_expert;
+                kind    = 2;
+            } else if (per_layer > 0) {
+                if (per_layer > n_expert) {
+                    LLAMA_LOG_WARN("%s: '%s' --mec-per-layer %d clamped to %d\n", __func__, w->name, per_layer, n_expert);
+                }
+                n_slots = std::min<int64_t>((int64_t) per_layer, n_expert);
+                kind    = 1;
+            } else {
+                if (cparams.expert_cache_slots >= n_expert) {
+                    LLAMA_LOG_WARN("%s: '%s' N=%d clamped to %d (n_expert - 1)\n",
+                            __func__, w->name, cparams.expert_cache_slots, n_expert - 1);
+                }
+                n_slots = std::min<int64_t>((int64_t) cparams.expert_cache_slots, n_expert - 1);
+            }
             if (n_slots <= 0) {
                 continue;
             }
+            plan.push_back({w, n_slots, kind});
+        }
+    }
 
-            const size_t pool_size = (size_t) n_slots * w->nb[2];
-            if (pool_size > pool_budget) {
-                n_skipped++;
-                LLAMA_LOG_INFO("%s: '%s' (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
-                        __func__, w->name, n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
+    // Allocate each tensor under the budget with a priority: whole layers first, then the
+    // explicit --mec-per-layer values, then the dynamic layers scaled uniformly to
+    // whatever is left. Over-requesting -mec then degrades gracefully instead of
+    // silently dropping layers to the host-copy path.
+    auto kind_footprint = [&](char k) -> size_t {
+        size_t total = 0;
+        for (const auto & e : plan) {
+            if (e.kind == k) {
+                total += moe_pool_footprint(e.w, e.n_slots);
+            }
+        }
+        return total;
+    };
+
+    size_t whole_total = kind_footprint(2);
+    if (whole_total > pool_budget) {
+        LLAMA_LOG_WARN("%s: whole-layer pin does not fit the budget (%.2f > %.2f GiB), disabled\n",
+                __func__, whole_total / 1024.0 / 1024.0 / 1024.0, pool_budget / 1024.0 / 1024.0 / 1024.0);
+        for (auto & e : plan) {
+            if (e.kind == 2) {
+                e.kind = 0;
+            }
+        }
+        whole_total = 0;
+    }
+
+    size_t explicit_total = kind_footprint(1);
+    if (whole_total + explicit_total > pool_budget) {
+        LLAMA_LOG_WARN("%s: --mec-per-layer values do not fit the budget (%.2f GiB), disabled\n",
+                __func__, (whole_total + explicit_total) / 1024.0 / 1024.0 / 1024.0);
+        for (auto & e : plan) {
+            if (e.kind == 1) {
+                e.kind = 0;
+            }
+        }
+        explicit_total = 0;
+    }
+
+    const size_t budget_dynamic = pool_budget > (whole_total + explicit_total)
+            ? pool_budget - (whole_total + explicit_total) : 0;
+
+    auto total_dynamic_footprint = [&](float scale) -> size_t {
+        size_t total = 0;
+        for (const auto & e : plan) {
+            if (e.kind != 0) {
                 continue;
             }
-            pool_budget -= pool_size;
-
-            ggml_tensor * table = nullptr;
-            ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, backend_id, n_slots, &table);
-            if (pool == nullptr) {
-                continue; // allocation failed, keep serving this tensor from host memory
-            }
-
-            expert_pools.emplace(w, llama_expert_pool{pool, table});
-            n_pooled++;
+            const int slots = std::max(1, (int) ((float) e.n_slots * scale));
+            total += moe_pool_footprint(e.w, slots);
         }
+        return total;
+    };
+
+    float scale = 1.0f;
+    if (total_dynamic_footprint(1.0f) > budget_dynamic) {
+        // binary search the largest uniform scale that fits the budget
+        float lo = 0.0f;
+        float hi = 1.0f;
+        for (int it = 0; it < 32; ++it) {
+            const float mid = 0.5f*(lo + hi);
+            if (total_dynamic_footprint(mid) <= budget_dynamic) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        scale = lo;
+    }
+
+    // when even one slot per dynamic tensor does not fit, leave those on the host path
+    const bool dynamic_fits = total_dynamic_footprint(scale) <= budget_dynamic;
+
+    for (const auto & e : plan) {
+        if (expert_pools.find(e.w) != expert_pools.end()) {
+            continue; // safety: never register the same tensor twice
+        }
+        if (e.kind == 0 && !dynamic_fits) {
+            n_skipped++;
+            continue;
+        }
+        const int n_slots = (e.kind != 0) ? e.n_slots : std::max(1, (int) ((float) e.n_slots * scale));
+
+        ggml_tensor * table = nullptr;
+        ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), e.w, backend_id, n_slots, &table);
+        if (pool == nullptr) {
+            continue; // allocation failed, keep serving this tensor from host memory
+        }
+
+        expert_pools.emplace(e.w, llama_expert_pool{pool, table, n_slots == (int) e.w->ne[2]});
+        n_pooled++;
+
+        if (e.kind != 0) {
+            LLAMA_LOG_INFO("%s: '%s' %s: %d/%d experts (%.2f MiB)\n", __func__, e.w->name,
+                    e.kind == 2 ? "pinned whole layer" : "pinned per-layer", n_slots, (int) e.w->ne[2],
+                    moe_pool_footprint(e.w, n_slots) / 1024.0 / 1024.0);
+        }
+    }
+
+    if (scale < 1.0f) {
+        LLAMA_LOG_WARN("%s: requested slots do not fit the budget, scaled to %.0f%%\n", __func__, 100.0f*scale);
     }
 
     if (n_pooled > 0) {
@@ -3751,6 +3908,11 @@ llama_context_params llama_context_default_params() {
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.expert_cache_slots          =*/ 0,
+        /*.expert_cache_whole_count    =*/ 0,
+        /*.expert_cache_whole_layers   =*/ nullptr,
+        /*.n_expert_cache_whole_layers =*/ 0,
+        /*.expert_cache_per_layer      =*/ nullptr,
+        /*.n_expert_cache_per_layer    =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
@@ -4044,6 +4206,7 @@ int llama_get_expert_pool_records(
         r.backend_id   = g.backend_id;
         r.n_expert     = g.n_expert;
         r.n_slots      = g.n_slots;
+        r.n_expert_used = (int) ctx->get_model().hparams.n_expert_used;
         r.n_free       = g.n_free;
         r.n_hits       = g.n_hits;
         r.n_misses     = g.n_misses;
